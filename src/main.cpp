@@ -5,6 +5,8 @@
 #include <esp_pm.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
+#include <esp_rom_crc.h>
+#include <esp_spi_flash.h>
 #include <Preferences.h>
 #include "sd_backup.h"
 
@@ -135,33 +137,75 @@ void switchToOtaApp(int index) {
   }
   DBG_PRINTF("[OTA] Switching to \"%s\" (subtype %d)...\n", otaApps[index].name, subtype);
 
-  // Raw otadata switch (ported from CrossInk's ota_boot::switchTo).
+  // Raw otadata switch (ported from CrossInk's ota_boot::switchTo, src/network/OtaBootSwitch.cpp).
   // esp_ota_set_boot_partition() wraps esp_image_verify which is unreliable on X3 silicon
   // (bogus efuse-blk-rev errors on valid images). Write otadata directly.
+  //
+  // otadata layout: two esp_ota_select_entry_t, one per 4 KB flash sector.
+  // The bootloader boots the OTA slot indicated by the entry with the highest
+  // valid (CRC-checked) ota_seq: partition index = (ota_seq - 1) % OTA_SLOT_COUNT.
   const esp_partition_t* otaData = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
-  if (otaData) {
-    // otadata layout: two 32-byte entries at offset 0 and 32.
-    // Each entry: magic (0x5A), test_fail (0), partition label (8 bytes), hash (16 bytes).
-    // We write to the slot that is NOT the current one.
-    uint8_t buf[64];
-    esp_partition_read(otaData, 0, buf, 64);
-
-    // Determine which slot to write (alternate from current)
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    int currentSlot = (running->address == otaData->address + 0) ? 0 : 1;
-    int writeSlot = 1 - currentSlot;
-    uint32_t offset = writeSlot * 32;
-
-    // Build otadata entry
-    memset(buf, 0, 32);
-    buf[0] = 0x5A;  // magic
-    buf[1] = 0;     // test_fail = 0 (mark as good)
-    snprintf((char*)buf + 2, 8, "%s", target->label);
-
-    esp_partition_write(otaData, offset, buf, 32);
-    DBG_PRINTF("[OTA] otadata written at offset %d\n", offset);
+  if (!otaData || otaData->size < 2 * SPI_FLASH_SEC_SIZE) {
+    DBG_PRINTF("[OTA] otadata partition missing or too small\n");
+    return;
   }
+
+  struct OtaSelectEntry {           // mirrors esp_ota_select_entry_t
+    uint32_t ota_seq;
+    uint8_t seq_label[20];
+    uint32_t ota_state;
+    uint32_t crc;                   // CRC32 of ota_seq only
+  };
+  constexpr uint32_t OTA_IMG_NEW = 0x0;
+  constexpr uint32_t OTA_IMG_INVALID = 0x3;
+  constexpr uint32_t OTA_IMG_ABORTED = 0x4;
+  auto seqCrc = [](uint32_t seq) {
+    return esp_rom_crc32_le(UINT32_MAX, reinterpret_cast<const uint8_t*>(&seq), sizeof(seq));
+  };
+
+  OtaSelectEntry slots[2] = {};
+  if (esp_partition_read(otaData, 0, &slots[0], sizeof(OtaSelectEntry)) != ESP_OK ||
+      esp_partition_read(otaData, SPI_FLASH_SEC_SIZE, &slots[1], sizeof(OtaSelectEntry)) != ESP_OK) {
+    DBG_PRINTF("[OTA] otadata read failed\n");
+    return;
+  }
+
+  // Find the currently-active entry: valid CRC, highest seq, not INVALID/ABORTED.
+  int activeIdx = -1;
+  uint32_t activeSeq = 0;
+  for (int i = 0; i < 2; i++) {
+    if (slots[i].ota_seq == 0xFFFFFFFFu) continue;
+    if (slots[i].crc != seqCrc(slots[i].ota_seq)) continue;
+    if (slots[i].ota_state == OTA_IMG_INVALID || slots[i].ota_state == OTA_IMG_ABORTED) continue;
+    if (activeIdx < 0 || slots[i].ota_seq > activeSeq) {
+      activeIdx = i;
+      activeSeq = slots[i].ota_seq;
+    }
+  }
+
+  // Smallest seq > activeSeq that selects the destination slot (2 OTA partitions).
+  uint32_t destOtaIdx = static_cast<uint32_t>(target->subtype) -
+                        static_cast<uint32_t>(ESP_PARTITION_SUBTYPE_APP_OTA_0);
+  uint32_t newSeq = activeSeq + 1;
+  while (((newSeq - 1u) % 2u) != (destOtaIdx % 2u)) newSeq++;
+
+  OtaSelectEntry next = {};
+  next.ota_seq = newSeq;
+  memset(next.seq_label, 0xFF, sizeof(next.seq_label));
+  next.ota_state = OTA_IMG_NEW;
+  next.crc = seqCrc(next.ota_seq);
+
+  // Write to the entry the bootloader is NOT currently honoring, so the higher seq wins.
+  int writeSlot = (activeIdx == 0) ? 1 : 0;
+  size_t writeOff = static_cast<size_t>(writeSlot) * SPI_FLASH_SEC_SIZE;
+  if (esp_partition_erase_range(otaData, writeOff, SPI_FLASH_SEC_SIZE) != ESP_OK ||
+      esp_partition_write(otaData, writeOff, &next, sizeof(next)) != ESP_OK) {
+    DBG_PRINTF("[OTA] otadata erase/write failed (slot %d)\n", writeSlot);
+    return;
+  }
+  DBG_PRINTF("[OTA] otadata slot %d <- seq %u (boots %s)\n", writeSlot,
+             static_cast<unsigned>(newSeq), target->label);
 
   esp_restart();
 }
