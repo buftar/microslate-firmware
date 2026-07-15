@@ -2,6 +2,7 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 
 // X3 I2C fingerprint addresses (shared with CrossInk's cphw namespace)
@@ -20,6 +21,11 @@
 #define X3_I2C_SDA 20
 #define X3_I2C_SCL  0
 #define X3_I2C_FREQ 100000
+
+// Provenance: ported from Mark I (xteink-writer/lib/hal/HalGPIO.cpp:12,19-30)
+// GPIO13 SD power-gate — X3-only, active-high. Empirically necessary on X3;
+// absent from freeink-sdk's public board profile.
+#define SD_POWER_PIN 13
 
 namespace {
 constexpr char HW_NAMESPACE[] = "cphw";
@@ -121,6 +127,19 @@ void writeNvsDeviceValue(const char* key, uint8_t value) {
 
 void HalGPIO::begin() {
   inputMgr.begin();
+
+  // Provenance: Mark I (xteink-writer/lib/hal/HalGPIO.cpp:19-30)
+  // X3 has a dedicated SD card power-control pin (GPIO13, active-high) not
+  // present on X4 — drive it on before SPI/SD bring-up. Best-effort: if this
+  // turns out to be unnecessary on real hardware (SD already powered), the
+  // only cost is a little extra idle current, not a correctness bug.
+  if (_deviceType == DeviceType::X3) {
+    gpio_hold_dis(GPIO_NUM_13);
+    pinMode(SD_POWER_PIN, OUTPUT);
+    digitalWrite(SD_POWER_PIN, HIGH);
+    delay(10);  // let the SD card's power rail settle before SPI traffic
+  }
+
   SPI.begin(EPD_SCLK, SPI_MISO, EPD_MOSI, EPD_CS);
   // BAT_GPIO0 is configured for ADC via adc1_config_channel_atten in InputManager::begin()
   // — do NOT call pinMode() here as it reconfigures the pin as digital input in dual framework
@@ -146,6 +165,19 @@ bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
 
 void HalGPIO::startDeepSleep() {
+  // Provenance: Mark I (xteink-writer/lib/hal/HalGPIO.cpp:60-75)
+  // Power down the SD card rail for the sleep duration — previously left
+  // driven HIGH through deep sleep, which on X3 (hours/days between charges)
+  // is an avoidable continuous drain. gpio_hold_en + gpio_deep_sleep_hold_en
+  // are needed because a plain digitalWrite(LOW) does not survive the
+  // power-domain shutdown during deep sleep.
+  if (_deviceType == DeviceType::X3) {
+    gpio_hold_dis(GPIO_NUM_13);
+    digitalWrite(SD_POWER_PIN, LOW);
+    gpio_hold_en(GPIO_NUM_13);
+    gpio_deep_sleep_hold_en();
+  }
+
   // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
   while (inputMgr.isPressed(BTN_POWER)) {
     delay(50);
