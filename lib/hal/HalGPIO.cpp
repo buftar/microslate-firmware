@@ -122,7 +122,11 @@ void HalGPIO::begin() {
   SPI.begin(EPD_SCLK, SPI_MISO, EPD_MOSI, EPD_CS);
   // BAT_GPIO0 is configured for ADC via adc1_config_channel_atten in InputManager::begin()
   // — do NOT call pinMode() here as it reconfigures the pin as digital input in dual framework
-  pinMode(UART0_RXD, INPUT);
+  // On X4, GPIO20 (UART0_RXD) is used for USB detection.
+  // On X3, GPIO20 is I2C SDA for the BQ27220 gauge — do NOT configure it as digital input.
+  if (_deviceType != DeviceType::X3) {
+    pinMode(UART0_RXD, INPUT);
+  }
 }
 
 void HalGPIO::update() { inputMgr.update(); }
@@ -151,7 +155,65 @@ void HalGPIO::startDeepSleep() {
   esp_deep_sleep_start();
 }
 
+// ============================================================================
+// BQ27220 gauge battery reading (X3 only)
+// ============================================================================
+
+int HalGPIO::getBQ27220BatteryPercentage() const {
+  static int cachedPct = -1;
+  static unsigned long lastReadMs = 0;
+
+  // Load from NVS on first call
+  if (cachedPct < 0) {
+    Preferences prefs;
+    prefs.begin("battery", true);
+    cachedPct = prefs.getInt("pct", -1);
+    prefs.end();
+  }
+
+  unsigned long now = millis();
+
+  // Battery changes slowly — poll every 30 seconds
+  if (cachedPct < 0 || (now - lastReadMs) >= 30000) {
+    Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
+    uint16_t soc;
+    bool ok = readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_SOC_REG, &soc);
+    Wire.end();
+    pinMode(20, INPUT);
+    pinMode(0, INPUT);
+
+    if (ok) {
+      // BQ27220 SOC is in 0.1% units (0-1000 = 0%-100%)
+      int newPct = static_cast<int>(soc) / 10;
+      if (newPct > 100) newPct = 100;
+      if (newPct < 0) newPct = 0;
+
+      // Rate-limit drops: max 2% per read cycle
+      if (cachedPct >= 0 && newPct < cachedPct - 2) {
+        newPct = cachedPct - 2;
+      }
+
+      if (newPct != cachedPct) {
+        Preferences prefs;
+        prefs.begin("battery", false);
+        prefs.putInt("pct", newPct);
+        prefs.end();
+      }
+      cachedPct = newPct;
+    }
+    lastReadMs = now;
+  }
+
+  return cachedPct;
+}
+
 int HalGPIO::getBatteryPercentage() const {
+  // On X3, read from BQ22720 fuel gauge via I2C
+  if (_deviceType == DeviceType::X3) {
+    return getBQ27220BatteryPercentage();
+  }
+
+  // X4: ADC-based battery reading
   static const BatteryMonitor battery = BatteryMonitor(BAT_GPIO0);
   static int cachedPct = -1;
   static float smoothedMv = -1.0f;
@@ -220,7 +282,22 @@ int HalGPIO::getBatteryPercentage() const {
 }
 
 bool HalGPIO::isUsbConnected() const {
-  // U0RXD/GPIO20 reads HIGH when USB is connected
+  // On X3, GPIO20 is I2C SDA (gauge) — infer USB/charging from gauge current
+  if (_deviceType == DeviceType::X3) {
+    uint16_t raw;
+    Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
+    bool connected = readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_CUR_REG, &raw);
+    Wire.end();
+    pinMode(20, INPUT);
+    pinMode(0, INPUT);
+    if (connected) {
+      int16_t currentMa = static_cast<int16_t>(raw);
+      return currentMa > 50;  // Positive current = charging
+    }
+    return false;
+  }
+
+  // X4: U0RXD/GPIO20 reads HIGH when USB is connected
   return digitalRead(UART0_RXD) == HIGH;
 }
 

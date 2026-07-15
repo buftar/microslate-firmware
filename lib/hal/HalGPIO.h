@@ -16,13 +16,16 @@
 
 #define BAT_GPIO0 0  // Battery voltage
 
-#define UART0_RXD 20  // Used for USB connection detection
+#define UART0_RXD 20  // Used for USB connection detection (X4 only)
 
 class HalGPIO {
  public:
+  HalGPIO() = default;
+
   // Device detection (X3 vs X4 via I2C fingerprint)
   enum class DeviceType { X4 = 1, X3 = 2 };
-  HalGPIO() = default;
+  DeviceType detectDevice();
+  DeviceType getDeviceType() const { return _deviceType; }
 
   // Start button GPIO and setup SPI for screen and SD card
   void begin();
@@ -49,11 +52,6 @@ class HalGPIO {
 
   WakeupReason getWakeupReason() const;
 
-  // Device detection (X3 vs X4 via I2C fingerprint)
-  // Returns 1 = X4 (SSD1677), 2 = X3 (UC8253)
-  DeviceType detectDevice();
-  DeviceType getDeviceType() const { return _deviceType; }
-
   // Button indices
   static constexpr uint8_t BTN_BACK = 0;
   static constexpr uint8_t BTN_CONFIRM = 1;
@@ -68,4 +66,7 @@ class HalGPIO {
 #if CROSSPOINT_EMULATED == 0
   InputManager inputMgr;
 #endif
+
+  // X3 BQ27220 gauge battery reading
+  int getBQ27220BatteryPercentage() const;
 };

@@ -183,15 +183,11 @@ void setup() {
 
   setCpuFrequencyMhz(80);
 
+  // Detect hardware BEFORE gpio.begin() so pin configuration is correct
+  gpio.detectDevice();
   gpio.begin();
 
-  // Detect hardware (X3 vs X4) before display init
-  uint8_t deviceType = (gpio.getDeviceType() == HalGPIO::DeviceType::X3) ? 2 : 1;
-  if (gpio.detectDevice() == HalGPIO::DeviceType::X3) {
-    deviceType = 2;
-  }
-
-  display.begin(deviceType);
+  display.begin((gpio.getDeviceType() == HalGPIO::DeviceType::X3) ? 2 : 1);
 
   renderer.setFadingFix(true);  // Power down display analog circuits after each refresh — reduces idle drain
   rendererSetup(renderer);
