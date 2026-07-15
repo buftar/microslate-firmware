@@ -4,6 +4,11 @@
 #include <fstream>
 #include <vector>
 
+// Provenance: UC8253 LUTs vendored from freeink-sdk e93f67a
+// Source: CrossInk/freeink-sdk/libs/display/FreeInkDisplay/src/lut/Uc8253X3Luts.h
+// License: MIT (freeink-sdk)
+#include "Uc8253X3Luts.h"
+
 // SSD1677 command definitions
 // Initialization and reset
 #define CMD_SOFT_RESET 0x12             // Soft reset
@@ -39,6 +44,41 @@
 
 // Power management
 #define CMD_DEEP_SLEEP 0x10  // Deep sleep
+
+// ============================================================================
+// UC8253 (X3) command definitions
+// ============================================================================
+#define UC8253_CMD_PANEL_SETTING 0x00
+#define UC8253_CMD_POWER_SETTING 0x01
+#define UC8253_CMD_POWER_OFF 0x02
+#define UC8253_CMD_POWER_OFF_SEQ 0x03
+#define UC8253_CMD_POWER_ON 0x04
+#define UC8253_CMD_BOOSTER_SOFT_START 0x06
+#define UC8253_CMD_DEEP_SLEEP 0x07
+#define UC8253_CMD_DTM1 0x10
+#define UC8253_CMD_DATA_STOP 0x11
+#define UC8253_CMD_DISPLAY_REFRESH 0x12
+#define UC8253_CMD_DTM2 0x13
+#define UC8253_CMD_LUT_VCOM 0x20
+#define UC8253_CMD_LUT_WW 0x21
+#define UC8253_CMD_LUT_BW 0x22
+#define UC8253_CMD_LUT_WB 0x23
+#define UC8253_CMD_LUT_BB 0x24
+#define UC8253_CMD_PLL_CONTROL 0x30
+#define UC8253_CMD_VCOM_DATA_INTERVAL 0x50
+#define UC8253_CMD_RESOLUTION 0x61
+#define UC8253_CMD_GATE_SOURCE_START 0x65
+#define UC8253_CMD_VCOM_DC 0x82
+#define UC8253_CMD_LV_SELECTION 0xE1
+#define UC8253_CMD_PARTIAL_WINDOW 0x90
+#define UC8253_CMD_PARTIAL_IN 0x91
+#define UC8253_CMD_PARTIAL_OUT 0x92
+
+// UC8253 LUT length (42 of 43 bytes per array)
+#define UC8253_LUT_LEN 42
+
+// UC8253 busy polarity: two-phase (HIGH during waveform, then LOW)
+// For simplicity we poll HIGH==busy like SSD1677; the extra LOW phase is harmless.
 
 // Custom LUT for fast refresh
 const unsigned char lut_grayscale[] PROGMEM = {
@@ -126,8 +166,8 @@ EInkDisplay::EInkDisplay(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t 
   if (Serial) Serial.printf("[%lu]   SCLK=%d, MOSI=%d, CS=%d, DC=%d, RST=%d, BUSY=%d\n", millis(), sclk, mosi, cs, dc, rst, busy);
 }
 
-void EInkDisplay::begin() {
-  if (Serial) Serial.printf("[%lu] EInkDisplay: begin() called\n", millis());
+void EInkDisplay::begin(uint8_t deviceType) {
+  if (Serial) Serial.printf("[%lu] EInkDisplay: begin(deviceType=%d) called\n", millis(), deviceType);
 
   frameBuffer = frameBuffer0;
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
@@ -137,18 +177,13 @@ void EInkDisplay::begin() {
   // Initialize to white
   memset(frameBuffer0, 0xFF, BUFFER_SIZE);
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
-  if (Serial) Serial.printf("[%lu]   Static frame buffer (%lu bytes = 48KB)\n", millis(), BUFFER_SIZE);
+  if (Serial) Serial.printf("[%lu]   Static frame buffer (%lu bytes)\n", millis(), BUFFER_SIZE);
 #else
   memset(frameBuffer1, 0xFF, BUFFER_SIZE);
-  if (Serial) Serial.printf("[%lu]   Static frame buffers (2 x %lu bytes = 96KB)\n", millis(), BUFFER_SIZE);
+  if (Serial) Serial.printf("[%lu]   Static frame buffers (2 x %lu bytes)\n", millis(), BUFFER_SIZE);
 #endif
 
   if (Serial) Serial.printf("[%lu]   Initializing e-ink display driver...\n", millis());
-
-  // Initialize SPI with custom pins
-  SPI.begin(_sclk, -1, _mosi, _cs);
-  spiSettings = SPISettings(40000000, MSBFIRST, SPI_MODE0);  // MODE0 is standard for SSD1677
-  if (Serial) Serial.printf("[%lu]   SPI initialized at 40 MHz, Mode 0\n", millis());
 
   // Setup GPIO pins
   pinMode(_cs, OUTPUT);
@@ -164,10 +199,39 @@ void EInkDisplay::begin() {
   // Reset display
   resetDisplay();
 
-  // Initialize display controller
-  initDisplayController();
+  // Select panel driver based on device type
+  // deviceType: 0=auto (default SSD1677), 1=SSD1677 (X4), 2=UC8253 (X3)
+  if (deviceType == 2) {
+    _panelType = PANEL_UC8253;
+    _displayWidth = X3_DISPLAY_WIDTH;   // 792
+    _displayHeight = X3_DISPLAY_HEIGHT; // 528
+    _displayWidthBytes = _displayWidth / 8;
+    _bufferSize = static_cast<uint32_t>(_displayWidthBytes) * _displayHeight;
 
-  if (Serial) Serial.printf("[%lu]   E-ink display driver initialized\n", millis());
+    // Initialize SPI at 16 MHz for UC8253
+    SPI.begin(_sclk, -1, _mosi, _cs);
+    spiSettings = SPISettings(16000000, MSBFIRST, SPI_MODE0);
+    if (Serial) Serial.printf("[%lu]   SPI initialized at 16 MHz for UC8253 (X3)\n", millis());
+
+    initUC8253();
+  } else {
+    _panelType = PANEL_SSD1677;
+    _displayWidth = X4_DISPLAY_WIDTH;   // 800
+    _displayHeight = X4_DISPLAY_HEIGHT; // 480
+    _displayWidthBytes = _displayWidth / 8;
+    _bufferSize = static_cast<uint32_t>(_displayWidthBytes) * _displayHeight;
+
+    // Initialize SPI with custom pins at 40 MHz for SSD1677
+    SPI.begin(_sclk, -1, _mosi, _cs);
+    spiSettings = SPISettings(40000000, MSBFIRST, SPI_MODE0);
+    if (Serial) Serial.printf("[%lu]   SPI initialized at 40 MHz for SSD1677 (X4)\n", millis());
+
+    initSSD1677();
+  }
+
+  if (Serial) Serial.printf("[%lu]   E-ink display driver initialized (%s, %dx%d)\n", millis(),
+                            _panelType == PANEL_UC8253 ? "UC8253/X3" : "SSD1677/X4",
+                            _displayWidth, _displayHeight);
 }
 
 // ============================================================================
@@ -226,7 +290,7 @@ void EInkDisplay::waitWhileBusy(const char* comment) {
   }
 }
 
-void EInkDisplay::initDisplayController() {
+void EInkDisplay::initSSD1677() {
   if (Serial) Serial.printf("[%lu]   Initializing SSD1677 controller...\n", millis());
 
   const uint8_t TEMP_SENSOR_INTERNAL = 0x80;
@@ -259,7 +323,7 @@ void EInkDisplay::initDisplayController() {
   sendData(0x01);
 
   // Set up full screen RAM area
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
 
   // Fill both RAM banks with white so the first FAST_REFRESH has a clean baseline.
   // These commands write internal SRAM only — no visible display refresh.
@@ -278,7 +342,7 @@ void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t 
   constexpr uint8_t DATA_ENTRY_X_INC_Y_DEC = 0x01;
 
   // Reverse Y coordinate (gates are reversed on this display)
-  y = DISPLAY_HEIGHT - y - h;
+  y = _displayHeight - y - h;
 
   // Set data entry mode (X increment, Y decrement for reversed gates)
   sendCommand(CMD_DATA_ENTRY_MODE);
@@ -310,7 +374,7 @@ void EInkDisplay::setRamArea(const uint16_t x, uint16_t y, uint16_t w, uint16_t 
 }
 
 void EInkDisplay::clearScreen(const uint8_t color) const {
-  memset(frameBuffer, color, BUFFER_SIZE);
+  memset(frameBuffer, color, _bufferSize);
 }
 
 void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const uint16_t y, const uint16_t w, const uint16_t h,
@@ -326,14 +390,14 @@ void EInkDisplay::drawImage(const uint8_t* imageData, const uint16_t x, const ui
   // Copy image data to frame buffer
   for (uint16_t row = 0; row < h; row++) {
     const uint16_t destY = y + row;
-    if (destY >= DISPLAY_HEIGHT)
+    if (destY >= _displayHeight)
       break;
 
-    const uint16_t destOffset = destY * DISPLAY_WIDTH_BYTES + (x / 8);
+    const uint16_t destOffset = destY * _displayWidthBytes + (x / 8);
     const uint16_t srcOffset = row * imageWidthBytes;
 
     for (uint16_t col = 0; col < imageWidthBytes; col++) {
-      if ((x / 8 + col) >= DISPLAY_WIDTH_BYTES)
+      if ((x / 8 + col) >= _displayWidthBytes)
         break;
 
       if (fromProgmem) {
@@ -385,19 +449,19 @@ void EInkDisplay::grayscaleRevert() {
 }
 
 void EInkDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) {
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  writeRamBuffer(CMD_WRITE_RAM_BW, lsbBuffer, BUFFER_SIZE);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
+  writeRamBuffer(CMD_WRITE_RAM_BW, lsbBuffer, _bufferSize);
 }
 
 void EInkDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) {
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  writeRamBuffer(CMD_WRITE_RAM_RED, msbBuffer, BUFFER_SIZE);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
+  writeRamBuffer(CMD_WRITE_RAM_RED, msbBuffer, _bufferSize);
 }
 
 void EInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  writeRamBuffer(CMD_WRITE_RAM_BW, lsbBuffer, BUFFER_SIZE);
-  writeRamBuffer(CMD_WRITE_RAM_RED, msbBuffer, BUFFER_SIZE);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
+  writeRamBuffer(CMD_WRITE_RAM_BW, lsbBuffer, _bufferSize);
+  writeRamBuffer(CMD_WRITE_RAM_RED, msbBuffer, _bufferSize);
 }
 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
@@ -407,8 +471,8 @@ void EInkDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* 
  * grayscale display.
  */
 void EInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  writeRamBuffer(CMD_WRITE_RAM_RED, bwBuffer, BUFFER_SIZE);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
+  writeRamBuffer(CMD_WRITE_RAM_RED, bwBuffer, _bufferSize);
 }
 #endif
 
@@ -425,20 +489,28 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
     grayscaleRevert();
   }
 
-  // Set up full screen RAM area
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  if (_panelType == PANEL_UC8253) {
+    // UC8253: write frame to DTM2, refresh handles the rest
+    sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+    refreshDisplay(mode, turnOffScreen);
+    return;
+  }
+
+  // SSD1677 path
+  // Set up full screen RAM area using runtime dimensions
+  setRamArea(0, 0, _displayWidth, _displayHeight);
 
   if (mode != FAST_REFRESH) {
     // For full refresh, write to both buffers before refresh
-    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, _bufferSize);
+    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, _bufferSize);
   } else {
     // For fast refresh, write to BW buffer only
-    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, _bufferSize);
     // In single buffer mode, the RED RAM should already contain the previous frame
     // In dual buffer mode, we write back frameBufferActive which is the last frame
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, _bufferSize);
 #endif
   }
 
@@ -452,8 +524,8 @@ void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   // In single buffer mode always sync RED RAM after refresh to prepare for next fast refresh
   // This ensures RED contains the currently displayed frame for differential comparison
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
+  writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, _bufferSize);
 #endif
 }
 
@@ -464,7 +536,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   if (Serial) Serial.printf("[%lu]   Displaying window at (%d,%d) size (%dx%d)\n", millis(), x, y, w, h);
 
   // Validate bounds
-  if (x + w > DISPLAY_WIDTH || y + h > DISPLAY_HEIGHT) {
+  if (x + w > _displayWidth || y + h > _displayHeight) {
     if (Serial) Serial.printf("[%lu]   ERROR: Window bounds exceed display dimensions!\n", millis());
     return;
   }
@@ -498,7 +570,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   // Extract window region from frame buffer
   for (uint16_t row = 0; row < h; row++) {
     const uint16_t srcY = y + row;
-    const uint16_t srcOffset = srcY * DISPLAY_WIDTH_BYTES + (x / 8);
+    const uint16_t srcOffset = srcY * _displayWidthBytes + (x / 8);
     const uint16_t dstOffset = row * windowWidthBytes;
     memcpy(&windowBuffer[dstOffset], &frameBuffer[srcOffset], windowWidthBytes);
   }
@@ -514,7 +586,7 @@ void EInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   std::vector<uint8_t> previousWindowBuffer(windowBufferSize);
   for (uint16_t row = 0; row < h; row++) {
     const uint16_t srcY = y + row;
-    const uint16_t srcOffset = srcY * DISPLAY_WIDTH_BYTES + (x / 8);
+    const uint16_t srcOffset = srcY * _displayWidthBytes + (x / 8);
     const uint16_t dstOffset = row * windowWidthBytes;
     memcpy(&previousWindowBuffer[dstOffset], &frameBufferActive[srcOffset], windowWidthBytes);
   }
@@ -544,6 +616,12 @@ void EInkDisplay::displayGrayBuffer(const bool turnOffScreen) {
 }
 
 void EInkDisplay::refreshDisplay(const RefreshMode mode, const bool turnOffScreen) {
+  if (_panelType == PANEL_UC8253) {
+    refreshUC8253(mode, turnOffScreen);
+    return;
+  }
+
+  // SSD1677 path
   // Configure Display Update Control 1
   sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
   sendData((mode == FAST_REFRESH) ? CTRL1_NORMAL : CTRL1_BYPASS_RED);  // Configure buffer comparison mode
@@ -610,15 +688,15 @@ void EInkDisplay::beginRefresh(RefreshMode mode, const bool turnOffScreen) {
   }
 
   // Set up full screen RAM area
-  setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  setRamArea(0, 0, _displayWidth, _displayHeight);
 
   if (mode != FAST_REFRESH) {
-    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, _bufferSize);
+    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, _bufferSize);
   } else {
-    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_BW, frameBuffer, _bufferSize);
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_RED, frameBufferActive, _bufferSize);
 #endif
   }
 
@@ -689,8 +767,8 @@ bool EInkDisplay::pollRefresh() {
 
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   if (_refreshState == NEEDS_RED_SYNC) {
-    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, BUFFER_SIZE);
+    setRamArea(0, 0, _displayWidth, _displayHeight);
+    writeRamBuffer(CMD_WRITE_RAM_RED, frameBuffer, _bufferSize);
     _refreshState = IDLE;
     if (Serial) Serial.printf("[%lu]   pollRefresh: RED sync done\n", millis());
     return true;
@@ -733,6 +811,20 @@ void EInkDisplay::setCustomLUT(const bool enabled, const unsigned char* lutData)
 void EInkDisplay::deepSleep() {
   if (Serial) Serial.printf("[%lu]   Preparing display for deep sleep...\n", millis());
 
+  if (_panelType == PANEL_UC8253) {
+    // UC8253 deep sleep
+    if (isScreenOn) {
+      sendCommand(UC8253_CMD_POWER_OFF);
+      waitWhileBusy(" X3 power-down");
+      isScreenOn = false;
+    }
+    if (Serial) Serial.printf("[%lu]   Entering UC8253 deep sleep mode...\n", millis());
+    sendCommand(UC8253_CMD_DEEP_SLEEP);
+    sendData(0xA5);
+    return;
+  }
+
+  // SSD1677 deep sleep
   // First, power down the display properly
   // This shuts down the analog power rails and clock
   if (isScreenOn) {
@@ -803,4 +895,218 @@ void EInkDisplay::saveFrameBufferAsPBM(const char* filename) {
   (void)filename;
   if (Serial) Serial.println("saveFrameBufferAsPBM is not supported on Arduino builds.");
 #endif
+}
+
+// ============================================================================
+// UC8253 (X3) driver implementation
+// Adapted from freeink-sdk Uc8253X3Driver (MIT, e93f67a)
+// ============================================================================
+
+void EInkDisplay::loadUC8253Bank(const uint8_t* vcom, const uint8_t* ww, const uint8_t* bw,
+                                 const uint8_t* wb, const uint8_t* bb) {
+  sendCommand(UC8253_CMD_LUT_VCOM);
+  sendData(vcom, UC8253_LUT_LEN);
+  sendCommand(UC8253_CMD_LUT_WW);
+  sendData(ww, UC8253_LUT_LEN);
+  sendCommand(UC8253_CMD_LUT_BW);
+  sendData(bw, UC8253_LUT_LEN);
+  sendCommand(UC8253_CMD_LUT_WB);
+  sendData(wb, UC8253_LUT_LEN);
+  sendCommand(UC8253_CMD_LUT_BB);
+  sendData(bb, UC8253_LUT_LEN);
+}
+
+void EInkDisplay::loadUC8253BankCdi(uint8_t cdi0, uint8_t cdi1, const uint8_t* vcom,
+                                    const uint8_t* ww, const uint8_t* bw,
+                                    const uint8_t* wb, const uint8_t* bb) {
+  sendCommand(UC8253_CMD_VCOM_DATA_INTERVAL);
+  sendData(cdi0);
+  sendData(cdi1);
+  loadUC8253Bank(vcom, ww, bw, wb, bb);
+}
+
+void EInkDisplay::triggerUC8253Refresh(bool turnOff) {
+  if (!isScreenOn) {
+    sendCommand(UC8253_CMD_POWER_ON);
+    waitWhileBusy(" X3_PON");
+    isScreenOn = true;
+  }
+  sendCommand(UC8253_CMD_DISPLAY_REFRESH);
+  waitWhileBusy(" X3_DRF");
+  if (turnOff) {
+    sendCommand(UC8253_CMD_POWER_OFF);
+    waitWhileBusy(" X3_POF");
+    isScreenOn = false;
+  }
+}
+
+void EInkDisplay::fillUC8253Plane(uint8_t cmd, uint8_t value, uint16_t rows, uint16_t widthBytes) {
+  sendCommand(cmd);
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(_dc, HIGH);
+  digitalWrite(_cs, LOW);
+  for (uint32_t i = 0; i < static_cast<uint32_t>(rows) * widthBytes; i++) {
+    SPI.transfer(value);
+  }
+  digitalWrite(_cs, HIGH);
+  SPI.endTransaction();
+}
+
+void EInkDisplay::sendUC8253Plane(uint8_t cmd, const uint8_t* data, uint16_t rows, uint16_t widthBytes) {
+  sendCommand(cmd);
+  sendData(data, static_cast<uint16_t>(static_cast<uint32_t>(rows) * widthBytes));
+  sendCommand(UC8253_CMD_DATA_STOP);
+}
+
+void EInkDisplay::initUC8253() {
+  if (Serial) Serial.printf("[%lu]   Initializing UC8253 controller (X3)...\n", millis());
+
+  // Panel setting
+  sendCommand(UC8253_CMD_PANEL_SETTING);
+  sendData(0x3F);
+  sendData(0x0A);
+
+  // Resolution (792x528)
+  sendCommand(UC8253_CMD_RESOLUTION);
+  sendData(0x03); // 792 = 0x318
+  sendData(0x18);
+  sendData(0x02); // 528 = 0x0210
+  sendData(0x10);
+
+  // Gate source start
+  sendCommand(UC8253_CMD_GATE_SOURCE_START);
+  sendData(0x00);
+  sendData(0x00);
+  sendData(0x00);
+  sendData(0x00);
+
+  // Power off sequence
+  sendCommand(UC8253_CMD_POWER_OFF_SEQ);
+  sendData(0x20);
+
+  // Power setting
+  sendCommand(UC8253_CMD_POWER_SETTING);
+  sendData(0x07);
+  sendData(0x17);
+  sendData(0x3F);
+  sendData(0x3F);
+  sendData(0x17);
+
+  // VCOM DC
+  sendCommand(UC8253_CMD_VCOM_DC);
+  sendData(0x24);
+
+  // Booster soft start
+  sendCommand(UC8253_CMD_BOOSTER_SOFT_START);
+  sendData(0x25);
+  sendData(0x25);
+  sendData(0x3C);
+  sendData(0x37);
+
+  // PLL control
+  sendCommand(UC8253_CMD_PLL_CONTROL);
+  sendData(0x09);
+
+  // LV selection
+  sendCommand(UC8253_CMD_LV_SELECTION);
+  sendData(0x02);
+
+  // Fill both planes white (UC8253 has no auto-write clear)
+  fillUC8253Plane(UC8253_CMD_DTM1, 0xFF, _displayHeight, _displayWidthBytes);
+  sendCommand(UC8253_CMD_DATA_STOP);
+  fillUC8253Plane(UC8253_CMD_DTM2, 0xFF, _displayHeight, _displayWidthBytes);
+  sendCommand(UC8253_CMD_DATA_STOP);
+
+  isScreenOn = false;
+  _pendingResyncs = 2; // Initial full syncs needed
+
+  if (Serial) Serial.printf("[%lu]   UC8253 controller initialized\n", millis());
+}
+
+void EInkDisplay::refreshUC8253(RefreshMode mode, bool turnOffScreen) {
+  using namespace freeink;
+  
+  if (!isScreenOn && !turnOffScreen) {
+    mode = HALF_REFRESH; // Wake transition gets stronger waveform
+  }
+
+  const bool fastMode = (mode == FAST_REFRESH);
+  const bool halfMode = (mode == HALF_REFRESH);
+  const bool doFullSync = (!fastMode && !halfMode) || _pendingResyncs > 0;
+
+  if (doFullSync) {
+    // Full sync: OEM bank from white DTM1 baseline
+    loadUC8253BankCdi(0x29, 0x07,
+                      lut_x3_vcom_full, lut_x3_ww_full, lut_x3_bw_full, lut_x3_wb_full, lut_x3_bb_full);
+    fillUC8253Plane(UC8253_CMD_DTM1, 0xFF, _displayHeight, _displayWidthBytes);
+    sendCommand(UC8253_CMD_DATA_STOP);
+    sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+  } else if (halfMode) {
+    // Half scrub: WW==BW, WB==BB -> drive every pixel to target ignoring DTM1
+    loadUC8253BankCdi(0xA9, 0x07,
+                      lut_x3_vcom_half, lut_x3_ww_half, lut_x3_bw_half, lut_x3_wb_half, lut_x3_bb_half);
+    sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+  } else {
+    // Fast turbo differential; DTM1 retains previous frame
+    loadUC8253BankCdi(0x29, 0x07,
+                      lut_x3_vcom_fast, lut_x3_ww_fast, lut_x3_bw_fast, lut_x3_wb_fast, lut_x3_bb_fast);
+    sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+  }
+
+  // Power on for full sync even if already on
+  if (!isScreenOn || doFullSync) {
+    sendCommand(UC8253_CMD_POWER_ON);
+    waitWhileBusy(" X3_PON");
+    isScreenOn = true;
+  }
+  sendCommand(UC8253_CMD_DISPLAY_REFRESH);
+  waitWhileBusy(" X3_DRF");
+  if (turnOffScreen) {
+    sendCommand(UC8253_CMD_POWER_OFF);
+    waitWhileBusy(" X3_POF");
+    isScreenOn = false;
+  }
+
+  if (!fastMode) delay(200);
+
+  // Post-condition passes for full sync
+  if (doFullSync) {
+    const uint16_t xEnd = _displayWidth - 1;
+    const uint16_t yEnd = _displayHeight - 1;
+    uint8_t postPasses = (_pendingResyncs == 1) ? 1 : _pendingResyncs;
+    if (postPasses > 0) {
+      uint8_t win[9] = {0x00, 0x00, static_cast<uint8_t>(xEnd >> 8), static_cast<uint8_t>(xEnd & 0xFF),
+                        0x00, 0x00, static_cast<uint8_t>(yEnd >> 8), static_cast<uint8_t>(yEnd & 0xFF), 0x01};
+      loadUC8253BankCdi(0xA9, 0x07,
+                        lut_x3_vcom_normal, lut_x3_ww_normal, lut_x3_bw_normal, lut_x3_wb_normal, lut_x3_bb_normal);
+      for (uint8_t i = 0; i < postPasses; i++) {
+        sendCommand(UC8253_CMD_PARTIAL_IN);
+        sendCommand(UC8253_CMD_PARTIAL_WINDOW);
+        sendData(win, 9);
+        sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+        sendCommand(UC8253_CMD_PARTIAL_OUT);
+        triggerUC8253Refresh(false);
+      }
+    }
+  }
+
+  // Sync DTM1 with current frame for next fast diff
+  sendUC8253Plane(UC8253_CMD_DTM1, frameBuffer, _displayHeight, _displayWidthBytes);
+
+  // First differential after full sync: no-op fast settle
+  if (doFullSync) {
+    loadUC8253BankCdi(0x29, 0x07,
+                      lut_x3_vcom_fast, lut_x3_ww_fast, lut_x3_bw_fast, lut_x3_wb_fast, lut_x3_bb_fast);
+    sendUC8253Plane(UC8253_CMD_DTM2, frameBuffer, _displayHeight, _displayWidthBytes);
+    triggerUC8253Refresh(turnOffScreen);
+    sendUC8253Plane(UC8253_CMD_DTM1, frameBuffer, _displayHeight, _displayWidthBytes);
+  }
+
+  if (doFullSync && _pendingResyncs > 0) {
+    _pendingResyncs--;
+  }
+}
+
+void EInkDisplay::requestResync(uint8_t settlePasses) {
+  _pendingResyncs = settlePasses;
 }
