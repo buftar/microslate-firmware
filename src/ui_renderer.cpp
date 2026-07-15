@@ -58,6 +58,33 @@ extern int otaAppCount;
 
 // Extern shared state (defined in main.cpp)
 extern UIState currentState;
+
+// ============================================================================
+// Font-metric-relative layout helpers
+// All geometry derives from font line heights so one codebase renders correctly
+// at both 480x800 (X4) and 528x792 (X3).
+// ============================================================================
+
+// Row height for a given font: line height + small vertical padding
+static int rowHeight(GfxRenderer& r, int fontId) {
+  int lh = r.getLineHeight(fontId);
+  return (lh > 0) ? lh + 4 : 28;
+}
+
+// Standard margin unit (half a row of FONT_SMALL)
+static int marginUnit(GfxRenderer& r) {
+  return rowHeight(r, FONT_SMALL) / 2;
+}
+
+// Header height: title line + separator + small gap
+static int headerHeight(GfxRenderer& r) {
+  return rowHeight(r, FONT_SMALL) + marginUnit(r);
+}
+
+// Footer height: one line of FONT_SMALL with bottom margin
+static int footerHeight(GfxRenderer& r) {
+  return rowHeight(r, FONT_SMALL) + 4;
+}
 extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
@@ -197,7 +224,7 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   constexpr int bm = 60;
   if (sh > bm + 40) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12, "Arrows: Navigate  Enter: Select", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12, "Arrows: Navigate   Enter: Select", 0, tc);
     drawBleStatus(renderer, 20, sh - bm + 28);
   }
   drawBattery(renderer, gpio);
@@ -216,12 +243,13 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   // Header
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Notes", 0, tc, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
+  int headerH = headerHeight(renderer);
+  clippedLine(renderer, 5, headerH - 2, sw - 5, headerH - 2, tc);
 
   int fc = getFileCount();
-  int lineH = 30;
-  int listTop = 42;
-  int footerH = 28;  // one line of FONT_SMALL with safe bottom margin
+  int lineH = rowHeight(renderer, FONT_UI);
+  int listTop = headerH + 6;
+  int footerH = footerHeight(renderer);
   int maxVisible = (sh - listTop - footerH) / lineH;
   int startIdx = 0;
   if (fc > maxVisible && selectedFileIndex >= maxVisible) {
@@ -248,10 +276,10 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   // Footer
   clippedLine(renderer, 5, sh - footerH - 2, sw - 5, sh - footerH - 2, tc);
   if (deleteConfirmPending && fc > 0) {
-    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4, "Delete? Enter:Yes  Esc:No", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4, "Delete? Enter: Yes   Esc: No", 0, tc);
   } else {
     drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4,
-                    "Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
+                    "Ctrl+N: Title   Ctrl+D: Delete", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -477,7 +505,7 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
 
-  drawClippedText(renderer, FONT_SMALL, 20, 42, "Note title:", 0, tc);
+  drawClippedText(renderer, FONT_SMALL, 20, 42, "Note title: ", 0, tc);
   int boxY = 64, boxH = 36;
   int textY = boxY + 8;
   renderer.drawRect(15, boxY, sw - 30, boxH, tc);
@@ -485,12 +513,15 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
 
   // Cursor — thin bar aligned with text
   int cursorX = 20 + renderer.getTextAdvanceX(FONT_UI, renameBuffer);
+  int cursorH = renderer.getLineHeight(FONT_UI);
+  if (cursorH <= 0) cursorH = 16;
   if (cursorX + 2 < sw - 15)
-    renderer.fillRect(cursorX, textY, 2, 16, tc);
+    renderer.fillRect(cursorX, textY, 2, cursorH, tc);
 
   // Footer
-  clippedLine(renderer, 5, sh - 36, sw - 5, sh - 36, tc);
-  drawClippedText(renderer, FONT_SMALL, 10, sh - 30, "Enter: Confirm   Esc: Cancel", 0, tc);
+  int footerH = footerHeight(renderer);
+  clippedLine(renderer, 5, sh - footerH - 2, sw - 5, sh - footerH - 2, tc);
+  drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4, "Enter: Confirm   Esc: Cancel", 0, tc);
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
 }
@@ -571,7 +602,7 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, !darkMode);
     drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12,
-                    "Arrows:Navigate  Enter:Change  Esc:Back", 0, !darkMode);
+                    "Arrows: Navigate   Enter: Change   Esc: Back", 0, !darkMode);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -703,8 +734,8 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
   constexpr int bm = 60;
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter:Connect  Right:Scan", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left:Disconnect  Esc:Back", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter: Connect   Right: Scan", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left: Disconnect   Esc: Back", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -757,8 +788,8 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   constexpr int bm = 52;
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter:Connect  D:Forget", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left:Disconnect  Esc:Back", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter: Connect   D: Forget", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left: Disconnect   Esc: Back", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -807,7 +838,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       if (nc == 0) {
         const char* st = getSyncStatusText();
         drawClippedText(renderer, FONT_UI, 20, 60, st[0] ? st : "No networks found", sw - 40, tc);
-        drawClippedText(renderer, FONT_SMALL, 20, 90, "Enter: Rescan  Esc: Back", 0, tc);
+        drawClippedText(renderer, FONT_SMALL, 20, 90, "Enter: Rescan   Esc: Back", 0, tc);
       } else {
         drawClippedText(renderer, FONT_SMALL, 10, 38, "Select network:", 0, tc);
 
@@ -846,7 +877,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       constexpr int bm = 28;
       clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
       drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 4,
-                      "*=encrypted +=saved  Enter:Select  Esc:Back", 0, tc);
+                      "*=encrypted +=saved  Enter: Select   Esc: Back", 0, tc);
       break;
     }
 
@@ -870,8 +901,10 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       int cursorX = 20 + renderer.getTextAdvanceX(FONT_UI, dots);
       int cursorW = renderer.getSpaceWidth(FONT_UI);
       if (cursorW < 2) cursorW = 8;
+      int cursorH = renderer.getLineHeight(FONT_UI);
+      if (cursorH <= 0) cursorH = 20;
       if (cursorX + cursorW < sw)
-        renderer.fillRect(cursorX, 66, cursorW, 20, tc);
+        renderer.fillRect(cursorX, 66, cursorW, cursorH, tc);
 
       drawClippedText(renderer, FONT_SMALL, 20, 110, "Enter: Connect   Esc: Cancel", 0, tc);
       break;
