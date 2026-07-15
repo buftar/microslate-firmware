@@ -18,9 +18,16 @@ class HalDisplay {
   };
 
   // Initialize the display hardware and driver
-  void begin();
+  // deviceType: 1 = SSD1677 (X4), 2 = UC8253 (X3)
+  void begin(uint8_t deviceType = 1);
 
-  // Display dimensions
+  // Display dimensions - runtime getters (set by panel selection in begin())
+  uint16_t getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
+  uint16_t getDisplayHeight() const { return einkDisplay.getDisplayHeight(); }
+  uint16_t getDisplayWidthBytes() const { return einkDisplay.getDisplayWidthBytes(); }
+  uint32_t getBufferSize() const { return einkDisplay.getBufferSize(); }
+
+  // Legacy constexprs for backward compatibility (X4 defaults)
   static constexpr uint16_t DISPLAY_WIDTH = EInkDisplay::DISPLAY_WIDTH;
   static constexpr uint16_t DISPLAY_HEIGHT = EInkDisplay::DISPLAY_HEIGHT;
   static constexpr uint16_t DISPLAY_WIDTH_BYTES = DISPLAY_WIDTH / 8;
