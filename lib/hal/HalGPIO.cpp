@@ -9,9 +9,9 @@
 #define I2C_ADDR_DS3231  0x68  // RTC
 #define I2C_ADDR_QMI8658 0x6B  // IMU
 #define I2C_ADDR_QMI8658_ALT 0x6A  // IMU alternate address
-#define BQ27220_CUR_REG  0x0C  // Current register
-#define BQ27220_SOC_REG  0x08  // State of charge register
-#define BQ27220_VOLT_REG 0x09  // Voltage register
+#define BQ27220_CUR_REG  0x0C  // Current(), mA (s16 LE)
+#define BQ27220_SOC_REG  0x2C  // StateOfCharge(), percent (u16 LE)
+#define BQ27220_VOLT_REG 0x08  // Voltage(), mV (u16 LE)
 #define DS3231_SEC_REG   0x00  // Seconds register
 #define QMI8658_WHO_AM_I_REG 0x00  // Who am I register
 #define QMI8658_WHO_AM_I_VALUE 0x15
@@ -49,21 +49,23 @@ bool readI2CReg16LE(uint8_t addr, uint8_t reg, uint16_t* out) {
 }
 
 bool probeBQ27220Signature() {
-  uint16_t raw;
-  if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_CUR_REG, &raw)) return false;
-  int16_t current = static_cast<int16_t>(raw);
-  if (current < -500 || current > 500) return false;  // Sanity: within ±500mA
+  // Mirrors CrossInk lib/hal/HalGPIO.cpp probeBQ27220Signature: SoC plausibility
+  // plus a wide voltage window (charging can exceed nominal 4.2 V).
+  uint16_t soc;
+  if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_SOC_REG, &soc)) return false;
+  if (soc > 100) return false;
   uint16_t voltageMv;
   if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_VOLT_REG, &voltageMv)) return false;
-  if (voltageMv < 3200 || voltageMv > 4200) return false;  // Sanity: 3.2-4.2V
-  return true;
+  return voltageMv >= 2500 && voltageMv <= 5000;
 }
 
 bool probeDS3231Signature() {
   uint8_t sec;
   if (!readI2CReg8(I2C_ADDR_DS3231, DS3231_SEC_REG, &sec)) return false;
-  if (sec > 59) return false;  // BCD seconds: 0-59 valid
-  return true;
+  // BCD seconds: validate per digit (raw byte comparison would reject valid 40-59)
+  const uint8_t tensDigit = (sec >> 4) & 0x07;
+  const uint8_t onesDigit = sec & 0x0F;
+  return tensDigit <= 5 && onesDigit <= 9;
 }
 
 bool probeQMI8658Signature() {
@@ -183,8 +185,8 @@ int HalGPIO::getBQ27220BatteryPercentage() const {
     pinMode(0, INPUT);
 
     if (ok) {
-      // BQ27220 SOC is in 0.1% units (0-1000 = 0%-100%)
-      int newPct = static_cast<int>(soc) / 10;
+      // BQ27220 StateOfCharge() reports whole percent (0-100)
+      int newPct = static_cast<int>(soc);
       if (newPct > 100) newPct = 100;
       if (newPct < 0) newPct = 0;
 
