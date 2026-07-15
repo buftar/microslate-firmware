@@ -196,12 +196,11 @@ static void drawBleStatus(GfxRenderer& renderer, int x, int y) {
 // ===========================================================================
 
 void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;  // text color
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Title
   renderer.drawCenteredText(FONT_BODY, 30, "MicroSlate", tc, EpdFontFamily::BOLD);
@@ -233,12 +232,11 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
 }
 
 void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Header
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Notes", 0, tc, EpdFontFamily::BOLD);
@@ -388,12 +386,11 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
 }
 
 void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   int lineHeight = renderer.getLineHeight(editorFontId(fontSize));
   if (lineHeight <= 0) lineHeight = 20;
@@ -494,12 +491,11 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
 }
 
 void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Edit Title", 0, tc, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
@@ -527,11 +523,10 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
 }
 
 void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Settings", 0, !darkMode, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
@@ -612,10 +607,9 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
 
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Header
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Bluetooth Devices", 0, tc, EpdFontFamily::BOLD);
@@ -742,12 +736,11 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
 }
 
 void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Paired Keyboards", 0, tc, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
@@ -811,12 +804,11 @@ static void drawSignalBars(GfxRenderer& r, int x, int y, int rssi, bool color) {
 }
 
 void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
-  renderer.clearScreen();
+  renderer.clearScreen(darkMode ? 0x00 : 0xFF);
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
   bool tc = !darkMode;
 
-  if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Header
   drawClippedText(renderer, FONT_SMALL, 10, 5, "Sync", 0, tc, EpdFontFamily::BOLD);

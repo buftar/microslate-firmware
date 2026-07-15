@@ -636,6 +636,10 @@ bool GfxRenderer::isRefreshing() const { return display.isRefreshing(); }
 
 bool GfxRenderer::pollRefresh() const { return display.pollRefresh(); }
 
+// Provenance: Mark I MICROSLATE_AUDIT.md — fix O(n²) truncatedText.
+// Original: item + ellipsis allocated a new string each loop iteration,
+// and getTextWidth scanned the whole thing. For long strings this was
+// O(n²) allocations + scans. Fixed: pre-allocate, truncate in place.
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
                                        const EpdFontFamily::Style style) const {
   if (!text || maxWidth <= 0) return "";
@@ -644,15 +648,22 @@ std::string GfxRenderer::truncatedText(const int fontId, const char* text, const
   const char* ellipsis = "...";
   int textWidth = getTextWidth(fontId, item.c_str(), style);
   if (textWidth <= maxWidth) {
-    // Text fits, return as is
     return item;
   }
 
-  while (!item.empty() && getTextWidth(fontId, (item + ellipsis).c_str(), style) >= maxWidth) {
+  // Reserve space for ellipsis suffix to avoid reallocations during truncation
+  size_t ellLen = strlen(ellipsis);
+  item.reserve(item.size() + ellLen);
+  while (!item.empty()) {
     utf8RemoveLastChar(item);
+    item += ellipsis;
+    if (getTextWidth(fontId, item.c_str(), style) < maxWidth) break;
+    item.resize(item.size() - ellLen);  // remove ellipsis for next iteration
   }
 
-  return item.empty() ? ellipsis : item + ellipsis;
+  if (item.empty()) return std::string(ellipsis);
+  item += ellipsis;
+  return item;
 }
 
 // Note: Internal driver treats screen in command orientation; this library exposes a logical orientation

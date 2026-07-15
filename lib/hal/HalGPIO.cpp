@@ -331,7 +331,10 @@ bool HalGPIO::isUsbConnected() const {
     return false;
   }
 
-  // X4: U0RXD/GPIO20 reads HIGH when USB is connected
+  // X4: U0RXD/GPIO20 reads HIGH when USB is connected.
+  // HAZARD: On X3, GPIO20 is I2C SDA for the BQ27220 gauge — calling this
+  // on X3 hardware would read garbage from the I2C bus. The _deviceType
+  // guard above prevents this path from executing on X3.
   return digitalRead(UART0_RXD) == HIGH;
 }
 
