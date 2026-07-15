@@ -76,7 +76,7 @@ extern int otaAppCount;
 static constexpr size_t TEXT_BUFFER_SIZE = 16384;
 static constexpr int MAX_FILES = 50;
 static constexpr int INPUT_QUEUE_SIZE = 50;
-static constexpr int MAX_LINES = 1024;
+static constexpr int MAX_LINES = 4096;  // Provenance: Mark I increased from 1024 (MICROSLATE_AUDIT.md §3). With TEXT_BUFFER_SIZE=16KB, 1024 lines caps at ~15 chars/line average; 4096 handles short lines.
 
 // --- Font IDs (from crosspoint-reader fontIds.h) ---
 #define FONT_BODY    (-1014561631)   // NOTOSANS_14_FONT_ID
