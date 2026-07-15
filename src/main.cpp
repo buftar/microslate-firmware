@@ -121,6 +121,8 @@ static void detectOtaApps() {
 }
 
 // Switch to another OTA app by index into otaApps[]. Non-static so input_handler can call it.
+// Uses raw otadata writes (not esp_ota_set_boot_partition) for belt-and-braces against
+// the X3 image-verify bug that bogusly rejects valid images.
 void switchToOtaApp(int index) {
   if (index < 0 || index >= otaAppCount) return;
   int subtype = otaApps[index].partitionSubtype;
@@ -132,7 +134,35 @@ void switchToOtaApp(int index) {
     return;
   }
   DBG_PRINTF("[OTA] Switching to \"%s\" (subtype %d)...\n", otaApps[index].name, subtype);
-  esp_ota_set_boot_partition(target);
+
+  // Raw otadata switch (ported from CrossInk's ota_boot::switchTo).
+  // esp_ota_set_boot_partition() wraps esp_image_verify which is unreliable on X3 silicon
+  // (bogus efuse-blk-rev errors on valid images). Write otadata directly.
+  const esp_partition_t* otaData = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
+  if (otaData) {
+    // otadata layout: two 32-byte entries at offset 0 and 32.
+    // Each entry: magic (0x5A), test_fail (0), partition label (8 bytes), hash (16 bytes).
+    // We write to the slot that is NOT the current one.
+    uint8_t buf[64];
+    esp_partition_read(otaData, 0, buf, 64);
+
+    // Determine which slot to write (alternate from current)
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    int currentSlot = (running->address == otaData->address + 0) ? 0 : 1;
+    int writeSlot = 1 - currentSlot;
+    uint32_t offset = writeSlot * 32;
+
+    // Build otadata entry
+    memset(buf, 0, 32);
+    buf[0] = 0x5A;  // magic
+    buf[1] = 0;     // test_fail = 0 (mark as good)
+    snprintf((char*)buf + 2, 8, "%s", target->label);
+
+    esp_partition_write(otaData, offset, buf, 32);
+    DBG_PRINTF("[OTA] otadata written at offset %d\n", offset);
+  }
+
   esp_restart();
 }
 

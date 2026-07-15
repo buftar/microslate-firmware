@@ -29,6 +29,10 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
 }
 
 void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+  // X3 anti-ghosting: request resync before HALF refresh
+  if (mode == HalDisplay::HALF_REFRESH) {
+    einkDisplay.requestResync(1);
+  }
   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
 }
 
