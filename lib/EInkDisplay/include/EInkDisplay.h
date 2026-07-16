@@ -2,9 +2,13 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-// Provenance: UC8253 LUTs vendored from freeink-sdk e93f67a
-// Source: CrossInk/freeink-sdk/libs/display/FreeInkDisplay/src/lut/Uc8253X3Luts.h
-// License: MIT (freeink-sdk)
+// X3 (UC8253) is driven through the same vendored freeink-sdk PanelDriver
+// Mark I (xteink-writer) and CrossInk both use — not a hand-rolled command
+// sequence. See lib/FreeInkX3. That driver correctly implements UC8253's
+// X3TwoPhase BUSY protocol (wait for the LOW edge, then back to HIGH), which
+// a naive single-phase "wait while HIGH" (correct for SSD1677) gets wrong.
+#include <EpdBus.h>
+#include <PanelDriver.h>  // for freeink::RefreshMode, used by x3MapMode()'s declaration below
 
 class EInkDisplay {
  public:
@@ -148,15 +152,11 @@ class EInkDisplay {
   void initSSD1677();
   void refreshSSD1677(RefreshMode mode, bool turnOffScreen);
 
-  // ========== UC8253 (X3) commands ==========
-  void initUC8253();
-  void refreshUC8253(RefreshMode mode, bool turnOffScreen);
-  void loadUC8253Bank(const uint8_t* vcom, const uint8_t* ww, const uint8_t* bw, const uint8_t* wb, const uint8_t* bb);
-  void loadUC8253BankCdi(uint8_t cdi0, uint8_t cdi1, const uint8_t* vcom, const uint8_t* ww,
-                         const uint8_t* bw, const uint8_t* wb, const uint8_t* bb);
-  void triggerUC8253Refresh(bool turnOff);
-  void fillUC8253Plane(uint8_t cmd, uint8_t value, uint16_t rows, uint16_t widthBytes);
-  void sendUC8253Plane(uint8_t cmd, const uint8_t* data, uint16_t rows, uint16_t widthBytes);
+  // ========== UC8253 (X3) ==========
+  // Driven entirely through freeink::uc8253X3Driver() + _x3Bus below — see the
+  // provenance note at the top of this file.
+  freeink::EpdBus _x3Bus;
+  static freeink::RefreshMode x3MapMode(RefreshMode mode);
 
   // Low-level display control (shared)
   void resetDisplay();

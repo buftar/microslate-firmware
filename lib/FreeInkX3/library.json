@@ -1,0 +1,13 @@
+{
+  "name": "FreeInkX3",
+  "version": "1.0.0",
+  "description": "UC8253 panel driver for the Xteink X3, vendored from the open-source freeink-sdk (MIT) that CrossPoint ships. Used only when building for XTEINK_X3_HARDWARE.",
+  "authors": [
+    {
+      "name": "FreeInk project (vendored, see https://github.com/Free-Ink/freeink-sdk)"
+    }
+  ],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"]
+}
