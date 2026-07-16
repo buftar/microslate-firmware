@@ -732,7 +732,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
       int pageNum = (bluetoothDeviceSelection / maxDevicesToShow) + 1;
       int totalPages = (deviceCount + maxDevicesToShow - 1) / maxDevicesToShow;
       snprintf(navHint, sizeof(navHint), "Page %d/%d", pageNum, totalPages);
-      int navY = 90 + (devicesToShow * 30);
+      int navY = headY + (devicesToShow * rowHeight(renderer, FONT_UI));
       if (navY < sh - 100)
         drawClippedText(renderer, FONT_SMALL, 15, navY, navHint, 0, tc);
     }
