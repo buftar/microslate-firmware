@@ -208,11 +208,14 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   // Menu items (base + dynamically detected OTA apps)
   static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Sync"};
   int menuCount = 4 + otaAppCount;
+  const int rowH = renderer.getLineHeight(FONT_UI);
+  const int rowSpacing = rowH + 10;
+  const int highlightH = rowH + 10;
   for (int i = 0; i < menuCount; i++) {
-    int yPos = 90 + (i * 45);
+    int yPos = 90 + (i * rowSpacing);
     const char* label = (i < 4) ? baseMenuItems[i] : otaApps[i - 4].name;
     if (i == mainMenuSelection) {
-      clippedFillRect(renderer, 5, yPos - 5, sw - 10, 35, tc);
+      clippedFillRect(renderer, 5, yPos - 5, sw - 10, highlightH, tc);
       drawClippedText(renderer, FONT_UI, 20, yPos, label, sw - 40, !tc);
     } else {
       drawClippedText(renderer, FONT_UI, 20, yPos, label, sw - 40, tc);
@@ -220,11 +223,12 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   // Footer
-  constexpr int bm = 60;
+  const int footerLineH = renderer.getLineHeight(FONT_SMALL);
+  const int bm = 12 + footerLineH * 2 + 8;
   if (sh > bm + 40) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
     drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12, "Arrows: Navigate   Enter: Select", 0, tc);
-    drawBleStatus(renderer, 20, sh - bm + 28);
+    drawBleStatus(renderer, 20, sh - bm + 12 + footerLineH);
   }
   drawBattery(renderer, gpio);
 
@@ -539,7 +543,7 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   const int SETTINGS_COUNT = 6;
 
   // Compute line height to fit all items — use smaller spacing if needed
-  int lineH = 38;
+  int lineH = renderer.getLineHeight(FONT_UI) + 10;
   int listTop = 50;
   if (listTop + SETTINGS_COUNT * lineH > sh - 70) {
     lineH = (sh - 70 - listTop) / SETTINGS_COUNT;
@@ -616,6 +620,11 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
 
+  // Header block: stack each line by real font metrics instead of fixed
+  // offsets, so lines never collide regardless of font/panel.
+  const int smallRowH = rowHeight(renderer, FONT_SMALL);
+  int headY = 32 + marginUnit(renderer);
+
   // Connection status
   const char* status = "";
   switch (getConnectionState()) {
@@ -624,25 +633,31 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
     case BLEState::CONNECTING:   status = "Connecting..."; break;
     case BLEState::DISCONNECTED: status = "Not connected"; break;
   }
-  drawClippedText(renderer, FONT_SMALL, 10, 45, status, sw / 2 - 10, tc);
+  drawClippedText(renderer, FONT_SMALL, 10, headY, status, sw / 2 - 10, tc);
 
   // Paired device info
   std::string storedAddr, storedName;
   if (getStoredDevice(storedAddr, storedName)) {
     char pairedStr[64];
     snprintf(pairedStr, sizeof(pairedStr), "Paired: %s", storedName.c_str());
-    drawClippedText(renderer, FONT_SMALL, sw / 2, 45, pairedStr, sw / 2 - 10, tc);
+    drawClippedText(renderer, FONT_SMALL, sw / 2, headY, pairedStr, sw / 2 - 10, tc);
   }
+  headY += smallRowH;
 
   // Passkey display
   uint32_t passkey = getCurrentPasskey();
   if (passkey > 0) {
+    int y = headY;
+    drawClippedText(renderer, FONT_UI, 20, y, "PAIRING CODE:", 0, tc, EpdFontFamily::BOLD);
+    y += rowHeight(renderer, FONT_UI);
     char passkeyStr[32];
-    drawClippedText(renderer, FONT_UI, 20, 100, "PAIRING CODE:", 0, tc, EpdFontFamily::BOLD);
     snprintf(passkeyStr, sizeof(passkeyStr), "%06lu", passkey);
-    drawClippedText(renderer, FONT_BODY, 20, 130, passkeyStr, 0, tc, EpdFontFamily::BOLD);
-    drawClippedText(renderer, FONT_SMALL, 20, 160, "Type this code on your keyboard", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 20, 180, "then press Enter", 0, tc);
+    drawClippedText(renderer, FONT_BODY, 20, y, passkeyStr, 0, tc, EpdFontFamily::BOLD);
+    y += rowHeight(renderer, FONT_BODY);
+    drawClippedText(renderer, FONT_SMALL, 20, y, "Type this code on your keyboard", 0, tc);
+    y += smallRowH;
+    drawClippedText(renderer, FONT_SMALL, 20, y, "then press Enter", 0, tc);
+    headY = y + smallRowH;
   } else if (isDeviceScanning()) {
     static uint8_t dotPhase = 0;
     static uint32_t lastAnimMs = 0;
@@ -654,11 +669,12 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
     char scanningStr[64];
     int deviceCount = getDiscoveredDeviceCount();
     snprintf(scanningStr, sizeof(scanningStr), "Searching for devices%s", dots.c_str());
-    drawClippedText(renderer, FONT_SMALL, 10, 60, scanningStr, sw / 2 - 10, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, headY, scanningStr, sw / 2 - 10, tc);
 
     char foundStr[32];
     snprintf(foundStr, sizeof(foundStr), "Found: %d", deviceCount);
-    drawClippedText(renderer, FONT_SMALL, sw / 2, 60, foundStr, sw / 2 - 10, tc);
+    drawClippedText(renderer, FONT_SMALL, sw / 2, headY, foundStr, sw / 2 - 10, tc);
+    headY += smallRowH;
   }
 
   // Device list
@@ -668,7 +684,8 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
 
     char headerStr[64];
     snprintf(headerStr, sizeof(headerStr), "Available devices: %d", deviceCount);
-    drawClippedText(renderer, FONT_SMALL, 10, 70, headerStr, 0, tc, EpdFontFamily::BOLD);
+    drawClippedText(renderer, FONT_SMALL, 10, headY, headerStr, 0, tc, EpdFontFamily::BOLD);
+    headY += smallRowH;
 
     // Show up to 10 devices (pagination via scrolling)
     int maxDevicesToShow = 10;
@@ -681,7 +698,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
 
     for (int i = 0; i < devicesToShow; i++) {
       int deviceIndex = startIndex + i;
-      int yPos = 90 + (i * 30);
+      int yPos = headY + (i * rowHeight(renderer, FONT_UI));
 
       // Stop drawing if we'd go into the footer zone
       if (yPos > sh - 100) break;
@@ -697,7 +714,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
       int nameMaxW = sw - 100;
 
       if (isSelected || isConnected) {
-        clippedFillRect(renderer, 5, yPos - 5, sw - 10, 25, tc);
+        clippedFillRect(renderer, 5, yPos - 5, sw - 10, renderer.getLineHeight(FONT_UI) + 10, tc);
         drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, !tc);
       } else {
         drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, tc);
@@ -725,11 +742,12 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   // Footer
-  constexpr int bm = 60;
+  const int footerLineH = renderer.getLineHeight(FONT_SMALL);
+  const int bm = 8 + footerLineH * 2 + 8;
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter: Connect   Right: Scan", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left: Disconnect   Esc: Back", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8, "Enter: Connect   Right: Scan", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8 + footerLineH, "Left: Disconnect   Esc: Back", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -752,7 +770,7 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
     drawClippedText(renderer, FONT_SMALL, 20, 85, "Go to Bluetooth to scan and connect", 0, tc);
   } else {
     std::string currentAddr = getCurrentDeviceAddress();
-    int lineH = 38;
+    int lineH = rowHeight(renderer, FONT_UI);
     int listTop = 44;
 
     for (int i = 0; i < count; i++) {
@@ -778,11 +796,12 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
     }
   }
 
-  constexpr int bm = 52;
+  const int footerLineH = renderer.getLineHeight(FONT_SMALL);
+  const int bm = 8 + footerLineH * 2 + 8;
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter: Connect   D: Forget", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left: Disconnect   Esc: Back", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8, "Enter: Connect   D: Forget", 0, tc);
+    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8 + footerLineH, "Left: Disconnect   Esc: Back", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -832,10 +851,12 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
         drawClippedText(renderer, FONT_UI, 20, 60, st[0] ? st : "No networks found", sw - 40, tc);
         drawClippedText(renderer, FONT_SMALL, 20, 90, "Enter: Rescan   Esc: Back", 0, tc);
       } else {
-        drawClippedText(renderer, FONT_SMALL, 10, 38, "Select network:", 0, tc);
+        int headY = 32 + marginUnit(renderer);
+        drawClippedText(renderer, FONT_SMALL, 10, headY, "Select network:", 0, tc);
+        headY += rowHeight(renderer, FONT_SMALL);
 
-        int lineH = 28;
-        int listTop = 56;
+        int lineH = rowHeight(renderer, FONT_UI);
+        int listTop = headY;
         int footerH = 28;
         int maxVisible = (sh - listTop - footerH) / lineH;
         int startIdx = 0;
@@ -866,7 +887,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       }
 
       // Footer
-      constexpr int bm = 28;
+      const int bm = renderer.getLineHeight(FONT_SMALL) + 12;
       clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
       drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 4,
                       "*=encrypted +=saved  Enter: Select   Esc: Back", 0, tc);
@@ -937,7 +958,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       }
 
       // Display with auto-scroll: keep last [x] + next [-] in view
-      constexpr int lineH   = 22;
+      const int lineH   = rowHeight(renderer, FONT_SMALL);
       constexpr int listTop = 62;
       constexpr int footerH = 32;
       int maxVisible = (sh - listTop - footerH) / lineH;
@@ -962,7 +983,7 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       }
 
       // Footer
-      constexpr int bm = 28;
+      const int bm = renderer.getLineHeight(FONT_SMALL) + 12;
       clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
       char countStr[32];
       snprintf(countStr, sizeof(countStr), "Sent: %d   Esc: Cancel", sent);
