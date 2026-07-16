@@ -7,22 +7,20 @@ void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.ins
 void GfxRenderer::rotateCoordinates(const int x, const int y, int* rotatedX, int* rotatedY) const {
   switch (orientation) {
     case Portrait: {
-      // Logical portrait (480x800) → panel (800x480)
-      // Rotation: 90 degrees clockwise
+      // Logical portrait → panel landscape, rotated 90 degrees clockwise
       *rotatedX = y;
-      *rotatedY = HalDisplay::DISPLAY_HEIGHT - 1 - x;
+      *rotatedY = display.getDisplayHeight() - 1 - x;
       break;
     }
     case LandscapeClockwise: {
-      // Logical landscape (800x480) rotated 180 degrees (swap top/bottom and left/right)
-      *rotatedX = HalDisplay::DISPLAY_WIDTH - 1 - x;
-      *rotatedY = HalDisplay::DISPLAY_HEIGHT - 1 - y;
+      // Logical landscape rotated 180 degrees (swap top/bottom and left/right)
+      *rotatedX = display.getDisplayWidth() - 1 - x;
+      *rotatedY = display.getDisplayHeight() - 1 - y;
       break;
     }
     case PortraitInverted: {
-      // Logical portrait (480x800) → panel (800x480)
-      // Rotation: 90 degrees counter-clockwise
-      *rotatedX = HalDisplay::DISPLAY_WIDTH - 1 - y;
+      // Logical portrait → panel landscape, rotated 90 degrees counter-clockwise
+      *rotatedX = display.getDisplayWidth() - 1 - y;
       *rotatedY = x;
       break;
     }
@@ -49,13 +47,13 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   rotateCoordinates(x, y, &rotatedX, &rotatedY);
 
   // Bounds checking against physical panel dimensions
-  if (rotatedX < 0 || rotatedX >= HalDisplay::DISPLAY_WIDTH || rotatedY < 0 || rotatedY >= HalDisplay::DISPLAY_HEIGHT) {
+  if (rotatedX < 0 || rotatedX >= display.getDisplayWidth() || rotatedY < 0 || rotatedY >= display.getDisplayHeight()) {
     Serial.printf("[%lu] [GFX] !! Outside range (%d, %d) -> (%d, %d)\n", millis(), x, y, rotatedX, rotatedY);
     return;
   }
 
   // Calculate byte position and bit position
-  const uint16_t byteIndex = rotatedY * HalDisplay::DISPLAY_WIDTH_BYTES + (rotatedX / 8);
+  const uint16_t byteIndex = rotatedY * display.getDisplayWidthBytes() + (rotatedX / 8);
   const uint8_t bitPosition = 7 - (rotatedX % 8);  // MSB first
 
   if (state) {
@@ -671,28 +669,28 @@ int GfxRenderer::getScreenWidth() const {
   switch (orientation) {
     case Portrait:
     case PortraitInverted:
-      // 480px wide in portrait logical coordinates
-      return HalDisplay::DISPLAY_HEIGHT;
+      // narrow dimension in portrait logical coordinates
+      return display.getDisplayHeight();
     case LandscapeClockwise:
     case LandscapeCounterClockwise:
-      // 800px wide in landscape logical coordinates
-      return HalDisplay::DISPLAY_WIDTH;
+      // wide dimension in landscape logical coordinates
+      return display.getDisplayWidth();
   }
-  return HalDisplay::DISPLAY_HEIGHT;
+  return display.getDisplayHeight();
 }
 
 int GfxRenderer::getScreenHeight() const {
   switch (orientation) {
     case Portrait:
     case PortraitInverted:
-      // 800px tall in portrait logical coordinates
-      return HalDisplay::DISPLAY_WIDTH;
+      // tall dimension in portrait logical coordinates
+      return display.getDisplayWidth();
     case LandscapeClockwise:
     case LandscapeCounterClockwise:
-      // 480px tall in landscape logical coordinates
-      return HalDisplay::DISPLAY_HEIGHT;
+      // short dimension in landscape logical coordinates
+      return display.getDisplayHeight();
   }
-  return HalDisplay::DISPLAY_WIDTH;
+  return display.getDisplayWidth();
 }
 
 int GfxRenderer::getSpaceWidth(const int fontId) const {
