@@ -255,7 +255,7 @@ void setup() {
   DBG_INIT();
   DBG_PRINTLN("MicroSlate starting...");
 
-  setCpuFrequencyMhz(80);
+  setCpuFrequencyMhz(160);
 
   // Detect hardware BEFORE gpio.begin() so pin configuration is correct
   gpio.detectDevice();
@@ -324,7 +324,7 @@ void setup() {
   // ESP-IDF via sdkconfig.defaults (framework = arduino, espidf). BLE modem
   // sleep keeps the radio alive across sleep/wake cycles.
   esp_pm_config_esp32c3_t pm_config = {
-    .max_freq_mhz = 80,
+    .max_freq_mhz = 160,  // race to idle: render faster, drop back to min freq sooner
     .min_freq_mhz = 10,
     .light_sleep_enable = true
   };
@@ -750,9 +750,8 @@ void loop() {
   }
 
   // Poll display refresh — non-blocking check of BUSY pin
-  if (renderer.isRefreshing()) {
-    renderer.pollRefresh();
-  }
+  // Always poll: also runs the deferred X3 panel power-off once idle.
+  renderer.pollRefresh();
 
   // Don't start a new screen update while display is still refreshing
   if (screenDirty && !renderer.isRefreshing()) {

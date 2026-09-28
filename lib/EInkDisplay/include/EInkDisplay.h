@@ -144,6 +144,9 @@ class EInkDisplay {
   RefreshState _refreshState = IDLE;
   RefreshMode _pendingMode = FAST_REFRESH;
   unsigned long _refreshStartMs = 0;
+  // ponytail: X3 panel stays powered this long after a fast refresh; tune vs. idle drain
+  static constexpr unsigned long X3_POWER_OFF_DELAY_MS = 2000;
+  bool _x3PowerOffPending = false;
 
   // X3 resync tracking
   uint8_t _pendingResyncs = 0;
