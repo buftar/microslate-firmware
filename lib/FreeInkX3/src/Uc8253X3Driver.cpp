@@ -254,12 +254,19 @@ bool Uc8253X3Driver::beginFastDisplay(EpdBus& bus, const uint8_t* fb) {
   // conditions, plus !_isScreenOn/_inGrayscaleMode which display() handles by forcing a
   // different mode / reverting *before* the branch decision — so the fast branch would
   // never have been taken here either): bail, caller falls back to the synchronous path.
-  if (!_redRamSynced || _initialFullSyncsRemaining > 0 || _forceFullSyncNext || !_isScreenOn || _inGrayscaleMode) {
+  // Screen-off is NOT a bail case: the panel is only off here after an idle powerOff(),
+  // and fast-from-off is what the old power-off-every-refresh path always did.
+  if (!_redRamSynced || _initialFullSyncsRemaining > 0 || _forceFullSyncNext || _inGrayscaleMode) {
     return false;
   }
 
   loadBankCdi(bus, 0x29, 0x07, _cfg.fast);
   bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
+  if (!_isScreenOn) {
+    bus.cmd(CMD_POWER_ON);
+    bus.waitBusy(" X3_PON");
+    _isScreenOn = true;
+  }
   bus.cmd(CMD_DISPLAY_REFRESH);
   // No waitBusy() here — that's the whole point. pollFastDisplay() takes over from here.
   _fastPollState = BusyPollState::WaitLow;
@@ -471,12 +478,15 @@ void Uc8253X3Driver::skipInitialResync() {
   _redRamSynced = true;
 }
 
+void Uc8253X3Driver::powerOff(EpdBus& bus) {
+  if (!_isScreenOn) return;
+  bus.cmd(CMD_POWER_OFF);
+  bus.waitBusy(" X3_POF");
+  _isScreenOn = false;
+}
+
 void Uc8253X3Driver::deepSleep(EpdBus& bus) {
-  if (_isScreenOn) {
-    bus.cmd(CMD_POWER_OFF);
-    bus.waitBusy(" X3 power-down");
-    _isScreenOn = false;
-  }
+  powerOff(bus);
   bus.cmd(CMD_DEEP_SLEEP);
   bus.data(0xA5);
 }

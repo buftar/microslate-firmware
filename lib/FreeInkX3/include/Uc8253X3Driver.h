@@ -60,6 +60,9 @@ class Uc8253X3Driver : public PanelDriver {
   // pollFastDisplay() each loop() until it returns true.
   bool beginFastDisplay(EpdBus& bus, const uint8_t* fb);
   bool pollFastDisplay(EpdBus& bus, const uint8_t* fb);
+  // Power the panel down if it's on (fast refreshes leave it on so back-to-back
+  // refreshes skip the ~180 ms POWER_ON/OFF cycle; caller powers off once idle).
+  void powerOff(EpdBus& bus);
 
   bool supportsStripGrayscale() const override { return true; }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;

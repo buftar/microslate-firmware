@@ -457,6 +457,9 @@ static freeink::Uc8253X3Driver& x3Driver() {
 }
 
 void EInkDisplay::displayBuffer(RefreshMode mode, const bool turnOffScreen) {
+  // Never interleave a synchronous refresh with an in-flight non-blocking one.
+  while (!pollRefresh()) delay(1);
+
   if (!isScreenOn && !turnOffScreen)
   {
     // Force half refresh if screen is off
@@ -659,11 +662,15 @@ void EInkDisplay::refreshDisplay(const RefreshMode mode, const bool turnOffScree
 
 void EInkDisplay::beginRefresh(RefreshMode mode, const bool turnOffScreen) {
   if (_panelType == PANEL_UC8253) {
-    // Fast-refresh-while-screen-already-on is the actual per-keystroke hot
-    // path, and the only one worth making non-blocking (HALF/FULL/grayscale/
-    // turnOff/wake-from-off stay synchronous). beginFastDisplay() returns
-    // false for all of those cases and we fall back to the synchronous path.
-    if (mode == FAST_REFRESH && !turnOffScreen && x3Driver().beginFastDisplay(_x3Bus, frameBuffer)) {
+    // FAST is the per-keystroke hot path, and the only one worth making
+    // non-blocking (HALF/FULL/grayscale/wake-from-off stay synchronous).
+    // beginFastDisplay() returns false for those and we fall back to the
+    // synchronous path.
+    // turnOffScreen is deferred: pollRefresh() powers off once the panel has
+    // been idle for X3_POWER_OFF_DELAY_MS, so rapid navigation skips PON/POF.
+    if (mode == FAST_REFRESH && x3Driver().beginFastDisplay(_x3Bus, frameBuffer)) {
+      _x3PowerOffPending = turnOffScreen;
+      _refreshStartMs = millis();
       _refreshState = REFRESHING;
       return;
     }
@@ -735,7 +742,13 @@ void EInkDisplay::beginRefresh(RefreshMode mode, const bool turnOffScreen) {
 }
 
 bool EInkDisplay::pollRefresh() {
-  if (_refreshState == IDLE) return true;
+  if (_refreshState == IDLE) {
+    if (_x3PowerOffPending && millis() - _refreshStartMs > X3_POWER_OFF_DELAY_MS) {
+      _x3PowerOffPending = false;
+      x3Driver().powerOff(_x3Bus);
+    }
+    return true;
+  }
 
   // Timeout safety — 10 seconds
   if (millis() - _refreshStartMs > 10000) {
@@ -750,6 +763,7 @@ bool EInkDisplay::pollRefresh() {
       // once the waveform completes, so REFRESHING -> IDLE directly — no
       // separate NEEDS_RED_SYNC step needed.
       if (!x3Driver().pollFastDisplay(_x3Bus, frameBuffer)) return false;
+      _refreshStartMs = millis();  // idle power-off countdown starts at refresh end
       _refreshState = IDLE;
       return true;
     }
