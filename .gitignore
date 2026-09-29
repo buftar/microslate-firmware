@@ -7,4 +7,4 @@
 *.map
 .DS_Store
 Thumbs.db
-.claudeplatformio.local.ini
+.claude

@@ -25,7 +25,6 @@ class HalDisplay {
   uint16_t getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
   uint16_t getDisplayHeight() const { return einkDisplay.getDisplayHeight(); }
   uint16_t getDisplayWidthBytes() const { return einkDisplay.getDisplayWidthBytes(); }
-  uint32_t getBufferSize() const { return einkDisplay.getBufferSize(); }
 
   // Legacy constexprs for backward compatibility (X4 defaults)
   static constexpr uint16_t DISPLAY_WIDTH = EInkDisplay::DISPLAY_WIDTH;

@@ -22,7 +22,6 @@
 #define X3_I2C_SCL  0
 #define X3_I2C_FREQ 100000
 
-// Provenance: ported from Mark I (xteink-writer/lib/hal/HalGPIO.cpp:12,19-30)
 // GPIO13 SD power-gate — X3-only, active-high. Empirically necessary on X3;
 // absent from freeink-sdk's public board profile.
 #define SD_POWER_PIN 13
@@ -52,6 +51,17 @@ bool readI2CReg16LE(uint8_t addr, uint8_t reg, uint16_t* out) {
     return true;
   }
   return false;
+}
+
+// One gauge read on the X3 I2C bus. GPIO20 doubles as X4's USB-detect pin, so the
+// bus is opened per read and both pins released afterwards.
+bool readX3GaugeReg16(uint8_t reg, uint16_t* out) {
+  Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
+  const bool ok = readI2CReg16LE(I2C_ADDR_BQ27220, reg, out);
+  Wire.end();
+  pinMode(X3_I2C_SDA, INPUT);
+  pinMode(X3_I2C_SCL, INPUT);
+  return ok;
 }
 
 bool probeBQ27220Signature() {
@@ -102,8 +112,8 @@ X3ProbeResult runX3ProbePass() {
   result.qmi8658 = probeQMI8658Signature();
 
   Wire.end();
-  pinMode(20, INPUT);
-  pinMode(0, INPUT);
+  pinMode(X3_I2C_SDA, INPUT);
+  pinMode(X3_I2C_SCL, INPUT);
   return result;
 }
 
@@ -128,7 +138,6 @@ void writeNvsDeviceValue(const char* key, uint8_t value) {
 void HalGPIO::begin() {
   inputMgr.begin();
 
-  // Provenance: Mark I (xteink-writer/lib/hal/HalGPIO.cpp:19-30)
   // X3 has a dedicated SD card power-control pin (GPIO13, active-high) not
   // present on X4 — drive it on before SPI/SD bring-up. Best-effort: if this
   // turns out to be unnecessary on real hardware (SD already powered), the
@@ -165,7 +174,6 @@ bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
 
 void HalGPIO::startDeepSleep() {
-  // Provenance: Mark I (xteink-writer/lib/hal/HalGPIO.cpp:60-75)
   // Power down the SD card rail for the sleep duration — previously left
   // driven HIGH through deep sleep, which on X3 (hours/days between charges)
   // is an avoidable continuous drain. gpio_hold_en + gpio_deep_sleep_hold_en
@@ -209,14 +217,8 @@ int HalGPIO::getBQ27220BatteryPercentage() const {
 
   // Battery changes slowly — poll every 30 seconds
   if (cachedPct < 0 || (now - lastReadMs) >= 30000) {
-    Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
     uint16_t soc;
-    bool ok = readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_SOC_REG, &soc);
-    Wire.end();
-    pinMode(20, INPUT);
-    pinMode(0, INPUT);
-
-    if (ok) {
+    if (readX3GaugeReg16(BQ27220_SOC_REG, &soc)) {
       // BQ27220 StateOfCharge() reports whole percent (0-100)
       int newPct = static_cast<int>(soc);
       if (newPct > 100) newPct = 100;
@@ -319,22 +321,10 @@ bool HalGPIO::isUsbConnected() const {
   // On X3, GPIO20 is I2C SDA (gauge) — infer USB/charging from gauge current
   if (_deviceType == DeviceType::X3) {
     uint16_t raw;
-    Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
-    bool connected = readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_CUR_REG, &raw);
-    Wire.end();
-    pinMode(20, INPUT);
-    pinMode(0, INPUT);
-    if (connected) {
-      int16_t currentMa = static_cast<int16_t>(raw);
-      return currentMa > 50;  // Positive current = charging
-    }
-    return false;
+    return readX3GaugeReg16(BQ27220_CUR_REG, &raw) && static_cast<int16_t>(raw) > 50;  // positive = charging
   }
 
-  // X4: U0RXD/GPIO20 reads HIGH when USB is connected.
-  // HAZARD: On X3, GPIO20 is I2C SDA for the BQ27220 gauge — calling this
-  // on X3 hardware would read garbage from the I2C bus. The _deviceType
-  // guard above prevents this path from executing on X3.
+  // X4: U0RXD/GPIO20 reads HIGH when USB is connected (on X3 it's the gauge's SDA; see above)
   return digitalRead(UART0_RXD) == HIGH;
 }
 
@@ -357,29 +347,16 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
 }
 
 HalGPIO::DeviceType HalGPIO::detectDevice() {
-  // Check NVS override first (0=auto, 1=X4, 2=X3)
-  uint8_t override = readNvsDeviceValue(NVS_KEY_DEV_OVERRIDE, 0);
-  if (override == 2) {
-    if (Serial) Serial.println("[HW] Device override active: X3");
-    _deviceType = DeviceType::X3;
-    return _deviceType;
+  // NVS override first, then the cached probe result (both: 0=unknown, 1=X4, 2=X3)
+  const char* source = "override";
+  uint8_t known = readNvsDeviceValue(NVS_KEY_DEV_OVERRIDE, 0);
+  if (!known) {
+    source = "cached";
+    known = readNvsDeviceValue(NVS_KEY_DEV_CACHED, 0);
   }
-  if (override == 1) {
-    if (Serial) Serial.println("[HW] Device override active: X4");
-    _deviceType = DeviceType::X4;
-    return _deviceType;
-  }
-
-  // Check NVS cache
-  uint8_t cached = readNvsDeviceValue(NVS_KEY_DEV_CACHED, 0);
-  if (cached == 2) {
-    if (Serial) Serial.println("[HW] Using cached device type: X3");
-    _deviceType = DeviceType::X3;
-    return _deviceType;
-  }
-  if (cached == 1) {
-    if (Serial) Serial.println("[HW] Using cached device type: X4");
-    _deviceType = DeviceType::X4;
+  if (known) {
+    _deviceType = static_cast<DeviceType>(known);
+    if (Serial) Serial.printf("[HW] Using %s device type: %s\n", source, known == 2 ? "X3" : "X4");
     return _deviceType;
   }
 

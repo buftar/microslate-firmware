@@ -13,8 +13,6 @@ static char currentTitle[MAX_TITLE_LEN] = "Untitled";
 static bool unsavedChanges = false;
 
 // --- Line management ---
-// Provenance: incremental word-count and line-wrap ported from Mark I
-// (xteink-writer/src/text_editor.cpp, commit 786c27a).
 static int linePositions[MAX_LINES];  // Index into textBuffer for start of each line
 static int lineScratch[MAX_LINES];    // Scratch copy of the pre-edit line-start suffix, used by the incremental resync below to diff against post-edit offsets.
 static int lineCount = 0;
@@ -36,7 +34,6 @@ static int cachedWordCount = 0;
 // Forward declaration
 static void ensureCursorVisible(int visibleLines);
 
-// Provenance: Mark I (xteink-writer/src/text_editor.cpp, commit 786c27a)
 static inline bool isWordBoundaryChar(char c) {
   return c == ' ' || c == '\n' || c == '\t' || c == '\r';
 }
@@ -291,7 +288,6 @@ int editorGetCursorPosition() { return cursorPosition; }
 
 int editorGetWordCount() {
   // Incremental word count — maintained per edit, not rescanned every call.
-  // Provenance: Mark I (xteink-writer/src/text_editor.cpp, commit 786c27a).
   return cachedWordCount;
 }
 

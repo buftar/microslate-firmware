@@ -2,9 +2,8 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-// X3 (UC8253) is driven through the same vendored freeink-sdk PanelDriver
-// Mark I (xteink-writer) and CrossInk both use — not a hand-rolled command
-// sequence. See lib/FreeInkX3. That driver correctly implements UC8253's
+// X3 (UC8253) is driven through the vendored freeink-sdk PanelDriver that
+// CrossInk also uses — not a hand-rolled command sequence. See lib/FreeInkX3. That driver correctly implements UC8253's
 // X3TwoPhase BUSY protocol (wait for the LOW edge, then back to HIGH), which
 // a naive single-phase "wait while HIGH" (correct for SSD1677) gets wrong.
 #include <EpdBus.h>
@@ -26,7 +25,7 @@ class EInkDisplay {
   };
 
   // Initialize the display hardware and driver
-  // panelType: 0 = auto-detect (uses deviceType param), 1 = SSD1677 (X4), 2 = UC8253 (X3)
+  // deviceType: 1 = SSD1677 (X4), 2 = UC8253 (X3)
   void begin(uint8_t deviceType = 1);
 
   // Display dimensions - X4 (SSD1677) constants
@@ -36,12 +35,6 @@ class EInkDisplay {
   static constexpr uint16_t X3_DISPLAY_WIDTH = 792;
   static constexpr uint16_t X3_DISPLAY_HEIGHT = 528;
 
-  // Maximum dimensions across both panels (for static buffer sizing)
-  static constexpr uint16_t MAX_DISPLAY_WIDTH = X3_DISPLAY_HEIGHT;   // 528 (portrait max)
-  static constexpr uint16_t MAX_DISPLAY_HEIGHT = X4_DISPLAY_WIDTH;   // 800 (landscape max)
-  static constexpr uint16_t MAX_DISPLAY_WIDTH_BYTES = MAX_DISPLAY_HEIGHT / 8;  // 100
-  static constexpr uint32_t MAX_BUFFER_SIZE = MAX_DISPLAY_WIDTH_BYTES * MAX_DISPLAY_HEIGHT;  // 800*100 = 80,000... too big
-
   // Actual buffer sizing: X4 landscape = 800x480 = 48,000 B, X3 portrait = 528x792 = 52,272 B
   // Use the larger of the two common orientations
   static constexpr uint32_t BUFFER_SIZE = (X3_DISPLAY_WIDTH / 8) * X3_DISPLAY_HEIGHT;  // 52,272 B
@@ -50,7 +43,6 @@ class EInkDisplay {
   uint16_t getDisplayWidth() const { return _displayWidth; }
   uint16_t getDisplayHeight() const { return _displayHeight; }
   uint16_t getDisplayWidthBytes() const { return _displayWidthBytes; }
-  uint32_t getBufferSize() const { return _bufferSize; }
 
   // Legacy constexprs for backward compatibility (X4 defaults)
   static constexpr uint16_t DISPLAY_WIDTH = X4_DISPLAY_WIDTH;
@@ -104,10 +96,6 @@ class EInkDisplay {
 
   // Save the current framebuffer to a PBM file (desktop/test builds only)
   void saveFrameBufferAsPBM(const char* filename);
-
-  // Panel type query
-  bool isX3() const { return _panelType == PANEL_UC8253; }
-  bool isX4() const { return _panelType == PANEL_SSD1677; }
 
  private:
   enum PanelType { PANEL_SSD1677, PANEL_UC8253 };

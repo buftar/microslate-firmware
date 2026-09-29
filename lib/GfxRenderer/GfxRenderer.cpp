@@ -634,10 +634,7 @@ bool GfxRenderer::isRefreshing() const { return display.isRefreshing(); }
 
 bool GfxRenderer::pollRefresh() const { return display.pollRefresh(); }
 
-// Provenance: Mark I MICROSLATE_AUDIT.md — fix O(n²) truncatedText.
-// Original: item + ellipsis allocated a new string each loop iteration,
-// and getTextWidth scanned the whole thing. For long strings this was
-// O(n²) allocations + scans. Fixed: pre-allocate, truncate in place.
+// Truncates in place (one reserved buffer) instead of building item + ellipsis per iteration.
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
                                        const EpdFontFamily::Style style) const {
   if (!text || maxWidth <= 0) return "";
