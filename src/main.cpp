@@ -5,6 +5,7 @@
 #include <esp_pm.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
+#include <esp_task_wdt.h>
 #include <Preferences.h>
 #include "sd_backup.h"
 
@@ -15,6 +16,7 @@
 #include "file_manager.h"
 #include "ui_renderer.h"
 #include "wifi_sync.h"
+#include "keyboard_layout.h"
 
 // Enum for sleep reasons
 enum class SleepReason {
@@ -46,13 +48,22 @@ int selectedFileIndex = 0;
 int settingsSelection = 0;
 int bluetoothDeviceSelection = 0;
 int pairedKeyboardSelection = 0;
+bool pairedForgetPending = false;   // true while a "Forget keyboard?" confirmation is armed
 Orientation currentOrientation = Orientation::PORTRAIT;
 int charsPerLine = 40;
 bool screenDirty = true;
+bool btShowAllDevices = true;    // Bluetooth scan: show ALL devices by default (HID classification
+                                 // is unreliable — many keyboards don't advertise HID pre-connect,
+                                 // so hiding would drop them). Toggle can filter to keyboards-only.
 
 // Rename buffer
 char renameBuffer[MAX_FILENAME_LEN] = "";
 int renameBufferLen = 0;
+
+// In-document find (overlay within the text editor)
+bool editorFindMode = false;
+char findBuffer[MAX_FIND_LEN] = "";
+int findBufferLen = 0;
 
 // UI mode flags
 bool darkMode = false;
@@ -61,6 +72,7 @@ bool deleteConfirmPending = false;
 WritingMode writingMode = WritingMode::NORMAL;
 FontSize fontSize = FontSize::LARGE;
 bool showWordCount = true;
+KeyboardLayout currentKeyboardLayout = KeyboardLayout::QWERTY;
 
 // --- OTA App Detection ---
 OtaAppEntry otaApps[MAX_OTA_APPS];
@@ -196,6 +208,7 @@ void setup() {
   writingMode = static_cast<WritingMode>(uiPrefs.getUChar("writeMode", 0));
   fontSize = static_cast<FontSize>(uiPrefs.getUChar("fontSize", 2));
   showWordCount = uiPrefs.getBool("showWC", true);
+  currentKeyboardLayout = keyboardLayoutFromIndex(uiPrefs.getUChar("layout", 0));
 
   // Apply saved orientation
   {
@@ -222,11 +235,13 @@ void setup() {
       int wm = jsonGetInt(uiBuf, "writeMode");
       int fs = jsonGetInt(uiBuf, "fontSize");
       int wc = jsonGetInt(uiBuf, "showWC");
+      int kl = jsonGetInt(uiBuf, "layout");
       if (o  >= 0) { uiPrefs.putUChar("orient",    (uint8_t)o);  currentOrientation = static_cast<Orientation>(o); }
       if (d  >= 0) { uiPrefs.putBool("darkMode",   d != 0);      darkMode           = (d != 0); }
       if (wm >= 0) { uiPrefs.putUChar("writeMode", (uint8_t)wm); writingMode        = static_cast<WritingMode>(wm); }
       if (fs >= 0) { uiPrefs.putUChar("fontSize",  (uint8_t)fs); fontSize           = static_cast<FontSize>(fs); }
       if (wc >= 0) { uiPrefs.putBool("showWC",     wc != 0);     showWordCount      = (wc != 0); }
+      if (kl >= 0) { uiPrefs.putUChar("layout",    (uint8_t)kl); currentKeyboardLayout = keyboardLayoutFromIndex(kl); }
       // Re-apply orientation in case it changed
       GfxRenderer::Orientation gfxOrient = GfxRenderer::Portrait;
       switch (currentOrientation) {
@@ -254,6 +269,17 @@ void setup() {
   esp_err_t pm_err = esp_pm_configure(&pm_config);
   DBG_PRINTF("PM configure: %s\n", esp_err_to_name(pm_err));
 
+  // --- Hardware task watchdog -----------------------------------------------
+  // The IDF inits the Task WDT at boot (CONFIG_ESP_TASK_WDT=y). sdkconfig sets it to 30s
+  // with panic-reboot (CONFIG_ESP_TASK_WDT_TIMEOUT_S=30, CONFIG_ESP_TASK_WDT_PANIC=y);
+  // here we subscribe the Arduino loop task. A loop-task hang (BLE stall, display BUSY
+  // pin stuck, SD wedge) then becomes a clean reboot instead of a freeze that needs the
+  // manual 5s BACK hold. 30s clears the longest blocking loop op — the e-ink BUSY waits
+  // cap at 10s (EInkDisplay.cpp); the BLE connect runs on its own, unwatched task.
+  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
+  DBG_PRINTLN("Task watchdog: loop task subscribed (30s, panic)");
+
   // Initialize auto-reconnect to enabled by default
   autoReconnectEnabled = true;
 
@@ -274,7 +300,11 @@ void setup() {
 // Enter deep sleep - matches crosspoint pattern
 void enterDeepSleep(SleepReason reason) {
   DBG_PRINTLN("Entering deep sleep...");
-  
+
+  // Stop watching the loop task — the sleep prep below (full refresh + waiting for
+  // the power button to be released) blocks intentionally and must not trip the WDT.
+  esp_task_wdt_delete(NULL);
+
   // Render the sleep screen before entering deep sleep
   renderSleepScreen();
 
@@ -495,13 +525,18 @@ static void processPhysicalButtons() {
       break;
 
     case UIState::PAIRED_KEYBOARDS:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
+      if (btnUp && !btnUpLast) {
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
       if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+      }
+      if (btnRight && !btnRightLast) {
+        // Forget selected keyboard (arms an on-screen confirmation)
+        enqueueKeyEvent(HID_KEY_D, 0, true);
+        enqueueKeyEvent(HID_KEY_D, 0, false);
       }
       if (btnConfirm && !btnConfirmLast) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
@@ -608,6 +643,10 @@ void renderSleepScreen() {
 }
 
 void loop() {
+  // Feed the hardware watchdog every iteration. If the loop ever wedges for >30s
+  // this stops firing and the chip reboots cleanly instead of freezing.
+  esp_task_wdt_reset();
+
   // --- GPIO first: always poll buttons before anything else ---
   gpio.update();
 
@@ -657,8 +696,13 @@ void loop() {
     bool idleTrigger = (now - lastInputTime) > AUTO_SAVE_IDLE_MS
                     && (now - lastAutoSaveMs) > AUTO_SAVE_IDLE_MS;
     bool capTrigger  = (now - lastAutoSaveMs) > AUTO_SAVE_MAX_MS;
-    if (idleTrigger || capTrigger) {
+    // Flush at paragraph breaks (newline), rate-limited so holding Enter / fast
+    // paragraphs don't hammer the SD. Shrinks the worst-case crash loss to a line.
+    bool paraTrigger = editorHasParagraphBreakPending()
+                    && (now - lastAutoSaveMs) > AUTO_SAVE_PARA_MIN_MS;
+    if (idleTrigger || capTrigger || paraTrigger) {
       lastAutoSaveMs = now;
+      editorClearParagraphBreak();
       saveCurrentFile(false);  // Skip refreshFileList — file list unchanged by content update
     }
   }
@@ -688,25 +732,30 @@ void loop() {
   static WritingMode lastSavedWritingMode = writingMode;
   static FontSize lastSavedFontSize = fontSize;
   static bool lastSavedShowWordCount = showWordCount;
+  static KeyboardLayout lastSavedKeyboardLayout = currentKeyboardLayout;
   if (currentOrientation != lastSavedOrientation || darkMode != lastSavedDarkMode
       || writingMode != lastSavedWritingMode || fontSize != lastSavedFontSize
-      || showWordCount != lastSavedShowWordCount) {
+      || showWordCount != lastSavedShowWordCount
+      || currentKeyboardLayout != lastSavedKeyboardLayout) {
     uiPrefs.putUChar("orient", static_cast<uint8_t>(currentOrientation));
     uiPrefs.putBool("darkMode", darkMode);
     uiPrefs.putUChar("writeMode", static_cast<uint8_t>(writingMode));
     uiPrefs.putUChar("fontSize", static_cast<uint8_t>(fontSize));
     uiPrefs.putBool("showWC", showWordCount);
+    uiPrefs.putUChar("layout", static_cast<uint8_t>(currentKeyboardLayout));
     lastSavedOrientation = currentOrientation;
     lastSavedDarkMode = darkMode;
     lastSavedWritingMode = writingMode;
     lastSavedFontSize = fontSize;
     lastSavedShowWordCount = showWordCount;
+    lastSavedKeyboardLayout = currentKeyboardLayout;
     // Keep SD backup in sync so settings survive a firmware flash
-    static char uiBuf[128];
+    static char uiBuf[160];
     snprintf(uiBuf, sizeof(uiBuf),
-             "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,\"showWC\":%d}",
+             "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,\"showWC\":%d,\"layout\":%d}",
              (int)currentOrientation, darkMode ? 1 : 0,
-             (int)writingMode, (int)fontSize, showWordCount ? 1 : 0);
+             (int)writingMode, (int)fontSize, showWordCount ? 1 : 0,
+             (int)currentKeyboardLayout);
     if (!SdMan.exists("/microslate")) SdMan.mkdir("/microslate");
     sdWriteFile("/microslate/ui_prefs.json", uiBuf);
   }

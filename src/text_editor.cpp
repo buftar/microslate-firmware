@@ -7,6 +7,17 @@ static char textBuffer[TEXT_BUFFER_SIZE];
 static size_t textLength = 0;
 static int cursorPosition = 0;
 
+// --- Selection + clipboard ---
+// selectionAnchor < 0 means no selection. When >= 0, the selection is the range
+// between it and cursorPosition (empty if they coincide). The clipboard is a
+// separate buffer that persists across notes (never cleared on load/clear).
+static int selectionAnchor = -1;
+static char clipboard[TEXT_BUFFER_SIZE];
+static size_t clipboardLen = 0;
+
+// Set when a newline is inserted; consumed by the autosave (paragraph-break flush).
+static bool paragraphBreakPending = false;
+
 // --- File metadata ---
 static char currentFile[MAX_FILENAME_LEN] = "";
 static char currentTitle[MAX_TITLE_LEN] = "Untitled";
@@ -25,6 +36,77 @@ static bool lineBreaksDirty = true;  // Only recompute line breaks when buffer/c
 // Forward declaration
 static void ensureCursorVisible(int visibleLines);
 
+static bool isUtf8ContinuationByte(unsigned char c) {
+  return (c & 0xC0) == 0x80;
+}
+
+static int utf8CharLenAt(int pos) {
+  if (pos < 0 || pos >= (int)textLength) return 0;
+  unsigned char c = static_cast<unsigned char>(textBuffer[pos]);
+  int len = 1;
+  if (c < 0x80) len = 1;
+  else if ((c >> 5) == 0x6) len = 2;
+  else if ((c >> 4) == 0xE) len = 3;
+  else if ((c >> 3) == 0x1E) len = 4;
+  if (pos + len > (int)textLength) return 1;
+  return len;
+}
+
+static int utf8NextPos(int pos) {
+  if (pos >= (int)textLength) return (int)textLength;
+  int next = pos + utf8CharLenAt(pos);
+  return std::min(next, (int)textLength);
+}
+
+static int utf8PrevPos(int pos) {
+  if (pos <= 0) return 0;
+  pos--;
+  while (pos > 0 && isUtf8ContinuationByte(static_cast<unsigned char>(textBuffer[pos]))) {
+    pos--;
+  }
+  return pos;
+}
+
+static int utf8CountChars(int start, int end) {
+  start = std::max(0, start);
+  end = std::min(end, (int)textLength);
+  int count = 0;
+  for (int i = start; i < end; i = utf8NextPos(i)) {
+    count++;
+  }
+  return count;
+}
+
+static int lineContentEnd(int lineIndex) {
+  int lineStart = linePositions[lineIndex];
+  int lineEnd = (lineIndex + 1 < lineCount) ? linePositions[lineIndex + 1] : (int)textLength;
+  if (lineEnd > lineStart && textBuffer[lineEnd - 1] == '\n') lineEnd--;
+  return lineEnd;
+}
+
+static int byteOffsetForColumn(int lineStart, int lineEnd, int col) {
+  int pos = lineStart;
+  for (int i = 0; i < col && pos < lineEnd; i++) {
+    pos = utf8NextPos(pos);
+  }
+  return std::min(pos, lineEnd);
+}
+
+static void deleteByteRange(int start, int end) {
+  if (start < 0 || end <= start || start >= (int)textLength) return;
+  end = std::min(end, (int)textLength);
+
+  memmove(textBuffer + start, textBuffer + end, textLength - end);
+  textLength -= (end - start);
+  cursorPosition = start;
+  textBuffer[textLength] = '\0';
+  unsavedChanges = true;
+  lineBreaksDirty = true;
+
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
 // Recalculate line breaks (word wrap) and cursor position.
 // The O(textLength) line break loop only runs when the buffer or charsPerLine changed.
 // Cursor line/col is always recomputed (cheap O(cursorLine) with early exit).
@@ -37,7 +119,7 @@ void editorRecalculateLines() {
     int col = 0;
     int lastSpace = -1;
 
-    for (int i = 0; i < (int)textLength && lineCount < MAX_LINES; i++) {
+    for (int i = 0; i < (int)textLength && lineCount < MAX_LINES;) {
       if (textBuffer[i] == '\n') {
         // Hard line break
         if (lineCount < MAX_LINES) {
@@ -46,9 +128,11 @@ void editorRecalculateLines() {
         }
         col = 0;
         lastSpace = -1;
+        i++;
         continue;
       }
 
+      int charEnd = utf8NextPos(i);
       if (textBuffer[i] == ' ') {
         lastSpace = i;
       }
@@ -60,16 +144,18 @@ void editorRecalculateLines() {
         if (lastSpace > linePositions[lineCount - 1]) {
           breakPos = lastSpace + 1; // Break after space
         } else {
-          breakPos = i + 1;  // Hard break mid-word
+          breakPos = charEnd;  // Hard break mid-word, but never inside UTF-8
         }
 
         if (lineCount < MAX_LINES) {
           linePositions[lineCount] = breakPos;
           lineCount++;
         }
-        col = i + 1 - breakPos;
+        col = utf8CountChars(breakPos, charEnd);
         lastSpace = -1;
       }
+
+      i = charEnd;
     }
     lineBreaksDirty = false;
   }
@@ -83,7 +169,7 @@ void editorRecalculateLines() {
       break;
     }
   }
-  cursorCol = cursorPosition - linePositions[cursorLine];
+  cursorCol = utf8CountChars(linePositions[cursorLine], cursorPosition);
 }
 
 // Ensure cursor is visible by adjusting viewport
@@ -104,6 +190,7 @@ void editorInit() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = -1;
   currentFile[0] = '\0';
   strncpy(currentTitle, "Untitled", MAX_TITLE_LEN - 1);
   unsavedChanges = false;
@@ -116,6 +203,7 @@ void editorClear() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = -1;
   unsavedChanges = false;
   viewportStartLine = 0;
   lineBreaksDirty = true;
@@ -126,6 +214,7 @@ void editorLoadBuffer(size_t length) {
   textLength = length;
   textBuffer[textLength] = '\0';
   cursorPosition = (int)textLength;  // Start at end
+  selectionAnchor = -1;
   viewportStartLine = 0;
   lineBreaksDirty = true;
   editorRecalculateLines();
@@ -152,15 +241,30 @@ int editorGetWordCount() {
 }
 
 void editorInsertChar(char c) {
-  if (textLength >= TEXT_BUFFER_SIZE - 1) return;
+  char text[2] = {c, '\0'};
+  editorInsertText(text);
+}
+
+void editorInsertText(const char* text) {
+  if (!text || text[0] == '\0') return;
+  if (strchr(text, '\n')) paragraphBreakPending = true;  // flag paragraph breaks for autosave
+  // Typing over a selection replaces it.
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);  // cursor now at lo
+  }
+  size_t insertLen = strlen(text);
+  if (textLength + insertLen >= TEXT_BUFFER_SIZE) return;
 
   // Shift text right
-  for (int i = (int)textLength; i > cursorPosition; i--) {
-    textBuffer[i] = textBuffer[i - 1];
-  }
-  textBuffer[cursorPosition] = c;
-  cursorPosition++;
-  textLength++;
+  memmove(textBuffer + cursorPosition + insertLen,
+          textBuffer + cursorPosition,
+          textLength - cursorPosition);
+  memcpy(textBuffer + cursorPosition, text, insertLen);
+  cursorPosition += insertLen;
+  textLength += insertLen;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
   lineBreaksDirty = true;
@@ -170,89 +274,116 @@ void editorInsertChar(char c) {
 }
 
 void editorDeleteChar() {
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+    return;
+  }
   if (cursorPosition <= 0 || textLength == 0) return;
 
-  for (int i = cursorPosition - 1; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  cursorPosition--;
-  textLength--;
-  textBuffer[textLength] = '\0';
-  unsavedChanges = true;
-  lineBreaksDirty = true;
-
-  editorRecalculateLines();
-  ensureCursorVisible(storedVisibleLines);
+  int start = utf8PrevPos(cursorPosition);
+  deleteByteRange(start, cursorPosition);
 }
 
 void editorDeleteForward() {
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+    return;
+  }
   if (cursorPosition >= (int)textLength) return;
 
-  for (int i = cursorPosition; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  textLength--;
-  textBuffer[textLength] = '\0';
-  unsavedChanges = true;
-  lineBreaksDirty = true;
-
-  editorRecalculateLines();
-  ensureCursorVisible(storedVisibleLines);
+  int end = utf8NextPos(cursorPosition);
+  deleteByteRange(cursorPosition, end);
 }
 
-void editorMoveCursorLeft() {
+// Called at the start of a cursor move: extend=true arms/keeps the selection
+// anchor; extend=false drops any selection.
+static void updateSelectionAnchor(bool extend) {
+  if (extend) {
+    if (selectionAnchor < 0) selectionAnchor = cursorPosition;
+  } else {
+    selectionAnchor = -1;
+  }
+}
+
+void editorMoveCursorLeft(bool extend) {
+  // Plain Left with a selection collapses to its left edge, without moving further.
+  if (!extend && editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    cursorPosition = lo;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
+  updateSelectionAnchor(extend);
   if (cursorPosition > 0) {
-    cursorPosition--;
+    cursorPosition = utf8PrevPos(cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorRight() {
+void editorMoveCursorRight(bool extend) {
+  if (!extend && editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    cursorPosition = hi;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
+  updateSelectionAnchor(extend);
   if (cursorPosition < (int)textLength) {
-    cursorPosition++;
+    cursorPosition = utf8NextPos(cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorUp() {
+void editorMoveCursorUp(bool extend) {
+  updateSelectionAnchor(extend);
   // cursorLine/cursorCol are already valid from the previous operation
   if (cursorLine <= 0) return;
 
   int targetLine = cursorLine - 1;
   int lineStart = linePositions[targetLine];
-  int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  // Don't count trailing newline
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  int lineEnd = lineContentEnd(targetLine);
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = byteOffsetForColumn(lineStart, lineEnd, cursorCol);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorDown() {
+void editorMoveCursorDown(bool extend) {
+  updateSelectionAnchor(extend);
   if (cursorLine >= lineCount - 1) return;
 
   int targetLine = cursorLine + 1;
   int lineStart = linePositions[targetLine];
-  int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  int lineEnd = lineContentEnd(targetLine);
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = byteOffsetForColumn(lineStart, lineEnd, cursorCol);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorHome() {
+void editorMoveCursorHome(bool extend) {
+  updateSelectionAnchor(extend);
   cursorPosition = linePositions[cursorLine];
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorEnd() {
+void editorMoveCursorEnd(bool extend) {
+  updateSelectionAnchor(extend);
   int lineEnd;
   if (cursorLine + 1 < lineCount) {
     lineEnd = linePositions[cursorLine + 1];
@@ -265,6 +396,88 @@ void editorMoveCursorEnd() {
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
+
+// --- Selection + clipboard ---
+
+bool editorHasSelection() {
+  return selectionAnchor >= 0 && selectionAnchor != cursorPosition;
+}
+
+bool editorGetSelectionRange(int* lo, int* hi) {
+  if (!editorHasSelection()) return false;
+  int a = selectionAnchor;
+  int b = cursorPosition;
+  if (a > b) { int t = a; a = b; b = t; }
+  if (lo) *lo = a;
+  if (hi) *hi = b;
+  return true;
+}
+
+void editorSelectAll() {
+  if (textLength == 0) return;
+  selectionAnchor = 0;
+  cursorPosition = (int)textLength;
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
+void editorCopy() {
+  int lo, hi;
+  if (!editorGetSelectionRange(&lo, &hi)) return;
+  size_t n = (size_t)(hi - lo);
+  if (n >= TEXT_BUFFER_SIZE) n = TEXT_BUFFER_SIZE - 1;
+  memcpy(clipboard, textBuffer + lo, n);
+  clipboard[n] = '\0';
+  clipboardLen = n;
+}
+
+void editorCut() {
+  int lo, hi;
+  if (!editorGetSelectionRange(&lo, &hi)) return;
+  editorCopy();
+  selectionAnchor = -1;
+  deleteByteRange(lo, hi);  // sets cursor = lo, recalculates
+}
+
+void editorPaste() {
+  if (clipboardLen == 0) return;
+  // Replace an active selection, then insert the clipboard at the caret.
+  int lo, hi;
+  if (editorGetSelectionRange(&lo, &hi)) {
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+  }
+  editorInsertText(clipboard);  // bounds-checked; no-op if it would overflow
+}
+
+bool editorFindNext(const char* query) {
+  if (!query || query[0] == '\0' || textLength == 0) return false;
+  int qlen = (int)strlen(query);
+  if (qlen > (int)textLength) return false;
+
+  // Search forward from the caret, then wrap to the start. Plain byte compare is
+  // UTF-8 safe: the query's bytes only match a whole character's bytes in the buffer.
+  int from = cursorPosition;
+  int match = -1;
+  for (int i = from; i + qlen <= (int)textLength; i++) {
+    if (memcmp(textBuffer + i, query, qlen) == 0) { match = i; break; }
+  }
+  if (match < 0) {
+    for (int i = 0; i + qlen <= from && i + qlen <= (int)textLength; i++) {
+      if (memcmp(textBuffer + i, query, qlen) == 0) { match = i; break; }
+    }
+  }
+  if (match < 0) return false;
+
+  selectionAnchor = match;             // highlight the hit via the selection renderer
+  cursorPosition = match + qlen;       // caret past the match so Enter finds the next
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+  return true;
+}
+
+bool editorHasParagraphBreakPending() { return paragraphBreakPending; }
+void editorClearParagraphBreak() { paragraphBreakPending = false; }
 
 void editorSetCharsPerLine(int cpl) {
   if (cpl != charsPerLine) {

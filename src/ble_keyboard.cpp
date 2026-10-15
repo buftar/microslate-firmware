@@ -17,7 +17,10 @@ static NimBLEClient* pClient = nullptr;
 static NimBLERemoteService* pRemoteService = nullptr;
 static NimBLERemoteCharacteristic* pInputReportChar = nullptr;
 
-static BLEState bleState = BLEState::DISCONNECTED;
+// volatile: written from the BLE host task (callbacks), the connect task, and the
+// main loop. Without it the compiler can cache a stale value and miss transitions,
+// which showed up as reconnect stalls and the occasional race-driven reboot.
+static volatile BLEState bleState = BLEState::DISCONNECTED;
 static bool connectToKeyboard = false;
 static std::string keyboardAddress = "";
 static uint8_t keyboardAddressType = 0;
@@ -30,10 +33,12 @@ static Preferences prefs;
 // Global flag to control auto-reconnect behavior
 bool autoReconnectEnabled = true;
 
-// Reconnection backoff
-static unsigned long reconnectDelay = 5000;   // 5s initial — gives keyboard time to release old connection after deep sleep
+// Reconnection backoff. Starts at 5s and is capped at 5s — i.e. a steady 5s retry.
+// (The old 2min cap made a keyboard that returned after a while take minutes to
+// reconnect.) Last-used keyboard is tried first (reconnectKeyboardIndex seeding).
+static unsigned long reconnectDelay = 5000;   // 5s — gives the keyboard time to release its old link
 static unsigned long lastReconnectAttempt = 0;
-static constexpr unsigned long MAX_RECONNECT_DELAY = 120000;  // Cap at 2min (was 60s)
+static constexpr unsigned long MAX_RECONNECT_DELAY = 5000;  // steady 5s fallback polling
 
 // Multi-keyboard cycling: index of the keyboard to try on the next auto-reconnect attempt
 static int reconnectKeyboardIndex = 0;
@@ -50,11 +55,28 @@ static uint32_t scanStartMs = 0;
 static constexpr uint32_t DEVICE_STALE_MS = 10000;  // 10 seconds - reduced to prevent UI slowdown
 
 // FreeRTOS connect task
-static TaskHandle_t connectTaskHandle = nullptr;
+static volatile TaskHandle_t connectTaskHandle = nullptr;
 static volatile bool authSuccess = false;
+
+// When the current connect task started (millis). Used by bleLoop() to detect and
+// recover a wedged connect task so auto-reconnect can't deadlock forever.
+static volatile unsigned long connectTaskStartMs = 0;
 
 // Connection timeout in seconds
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
+
+// Timeout applied to the NEXT connect attempt. Manual pairing keeps the full 10s;
+// auto-reconnect uses a short value so a failed attempt (keyboard absent) releases
+// the radio quickly — without this, steady 5s polling holds the radio ~2/3 of the
+// time while disconnected (heavy drain + ADC noise). A present keyboard connects in <2s.
+static uint32_t nextConnectTimeoutMs = CONNECT_TIMEOUT_MS;
+static constexpr uint32_t RECONNECT_CONNECT_TIMEOUT_MS = 3500;
+
+// Hard ceiling for the whole connect task (connect + auth + service discovery).
+// Normal worst case is ~17s (10s connect + 5s auth + discovery); past 30s we assume
+// the NimBLE host wedged and force the state machine back to DISCONNECTED so the
+// auto-reconnect cycle resumes instead of the keyboard staying dead until reboot.
+static constexpr unsigned long CONNECT_TASK_TIMEOUT_MS = 30000;
 
 // Global variable to store the passkey for display
 static uint32_t currentPasskey = 0;
@@ -67,7 +89,19 @@ int getLastUsedKeyboardIndex();
 static void upsertDevice(const BleDeviceInfo& info) {
   for (auto &d : discoveredDevices) {
     if (d.address == info.address) {
+      // Preserve a previously-captured real name. A device sends several
+      // advertising packets; the name often arrives only in the scan response,
+      // while plain ADV packets have none (name == address). Without this, a
+      // later name-less packet would clobber the real name back to the MAC.
+      bool hadRealName = (d.name != d.address);
+      bool newHasRealName = (info.name != info.address);
+      std::string keptName = d.name;
+      bool keptHid = d.isHid;
+      uint16_t keptAppearance = d.appearance;
       d = info;
+      if (hadRealName && !newHasRealName) d.name = keptName;
+      d.isHid = d.isHid || keptHid;                       // HID flag is sticky once seen
+      if (d.appearance == 0) d.appearance = keptAppearance; // keep appearance if this packet lacked it
       return;
     }
   }
@@ -163,6 +197,11 @@ static class ScanCallbacks : public NimBLEScanCallbacks {
     info.rssi = dev->getRSSI();
     info.addressType = dev->getAddress().getType();
     info.lastSeenMs = millis();
+    // Classify so the UI can show keyboards first and hide clutter. Active scan
+    // folds scan-response data in here too. Not guaranteed (some keyboards only
+    // expose HID after connecting), so this only MARKS — never hides permanently.
+    info.isHid = dev->isAdvertisingService(NimBLEUUID((uint16_t)0x1812));
+    info.appearance = dev->getAppearance();
     upsertDevice(info);
     extern bool screenDirty;
     screenDirty = true;
@@ -370,14 +409,16 @@ static void bleConnectTask(void* param) {
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(&clientCallbacks, false);
   }
-  pClient->setConnectTimeout(CONNECT_TIMEOUT_MS);
+  pClient->setConnectTimeout(nextConnectTimeoutMs);
 
   // Step 1: Connect (blocks this task, main loop continues)
   NimBLEAddress addr(keyboardAddress, keyboardAddressType);
-  // Delete any stored bond before connecting — forces a fresh "Just Works" pairing
-  // instead of an encrypted reconnect. Prevents a NimBLE security-state crash when
-  // the keyboard still holds a stale connection from a previous unclean disconnect.
-  NimBLEDevice::deleteBond(addr);
+  // NOTE: we deliberately do NOT delete the bond here. The old code deleted it on
+  // EVERY connect attempt, forcing a full "Just Works" re-pair each time — which is
+  // why a keyboard that dropped mid-session often failed to come back. Stale
+  // cross-session bonds (the documented NimBLE security-state crash) are cleared once
+  // at boot in bleSetup(); the bond established on the first connect then persists, so
+  // in-session reconnects are fast encrypted reconnects with no re-pairing.
   if (!pClient->connect(addr, true)) {
     DBG_PRINTLN("[BLE-Task] Connection failed");
     bleState = BLEState::DISCONNECTED;
@@ -476,10 +517,16 @@ static void startConnectTask() {
     DBG_PRINTLN("[BLE] Connect task already running");
     return;
   }
-  // 20480 bytes: Logitech has a complex service tree (keyboard + media + battery reports
+  connectTaskStartMs = millis();  // for the wedged-task recovery guard in bleLoop()
+  // 32768 bytes: Logitech has a complex service tree (keyboard + media + battery reports
   // + many descriptors). NimBLE 2.x uses more per-call stack than 1.4.x — 12288 was
   // sufficient before but overflows during full service discovery on the Logitech.
-  xTaskCreate(bleConnectTask, "ble_conn", 20480, NULL, 1, &connectTaskHandle);
+  // Raised from 20480: keyboards with even heavier service trees (e.g. some split/ZMK
+  // boards) still panicked during discovery at 20480. ~200KB of free heap is available
+  // here, so the extra 12KB is cheap insurance; trim back only if RAM gets tight.
+  // Cast drops the volatile qualifier for the FreeRTOS API; xTaskCreate writes the
+  // handle once at creation, before the task is scheduled.
+  xTaskCreate(bleConnectTask, "ble_conn", 32768, NULL, 1, (TaskHandle_t*)&connectTaskHandle);
 }
 
 // --- NVS multi-keyboard helpers ---
@@ -524,6 +571,10 @@ static void nvs_clearSlot(int idx) {
 // --- SD card backup for BLE pairing ---
 
 static constexpr char BLE_BACKUP_PATH[] = "/microslate/ble_kb.json";
+
+// Set from the ble_conn task when a new keyboard is stored; consumed by bleLoop()
+// on the main task, which owns all SPI (display + SD) access.
+static volatile bool bleBackupPending = false;
 
 static void writeBleBackup() {
     static char buf[512];
@@ -575,13 +626,49 @@ uint32_t getCurrentPasskey() {
   return currentPasskey;
 }
 
+// --- BLE transmit power -----------------------------------------------------
+// Discrete steps in dBm, low->high. -9 is the battery-friendly default (verified
+// rock-solid with the author's keyboards); +9 is the chip maximum for weak or
+// distant keyboards whose own transmitter / antenna leaves the link at the edge.
+// Radio power is a real share of this device's battery budget, so the default
+// stays low and higher steps are strictly opt-in via Settings -> BLE Power.
+static const int8_t kTxPowerSteps[] = { -9, -3, 0, 3, 9 };
+static constexpr int kTxPowerStepCount =
+    sizeof(kTxPowerSteps) / sizeof(kTxPowerSteps[0]);
+static int g_txPowerIdx = 0;  // index into kTxPowerSteps; 0 => -9 dBm
+
+static void applyBleTxPower() {
+  NimBLEDevice::setPower(kTxPowerSteps[g_txPowerIdx]);
+}
+
+int8_t getBleTxPower() { return kTxPowerSteps[g_txPowerIdx]; }
+
+const char* getBleTxPowerLabel() {
+  static char buf[20];
+  const char* tag = "";
+  if (g_txPowerIdx == 0) tag = " (Battery)";
+  else if (g_txPowerIdx == kTxPowerStepCount - 1) tag = " (Max)";
+  snprintf(buf, sizeof(buf), "%+d dBm%s", (int)kTxPowerSteps[g_txPowerIdx], tag);
+  return buf;
+}
+
+void cycleBleTxPower(int dir) {
+  g_txPowerIdx =
+      (g_txPowerIdx + (dir >= 0 ? 1 : -1) + kTxPowerStepCount) % kTxPowerStepCount;
+  applyBleTxPower();                                  // takes effect live (global)
+  prefs.putChar("tx_power", kTxPowerSteps[g_txPowerIdx]);  // persist chosen dBm
+}
+
 void bleSetup() {
   NimBLEDevice::init("MicroSlate");
-  // bond=true, MITM=false (we don't require it), SC=false (legacy compat for Logitech etc.)
-  // DISPLAY_YESNO: we can show a number and confirm — lets keyboards that *do* want
-  // numeric comparison (Apple Magic Keyboard, etc.) initiate it while still falling
-  // back to "Just Works" for keyboards that don't need it.
-  NimBLEDevice::setSecurityAuth(true, false, false);
+  // bond=true, MITM=false (we don't require it), SC=true (LE Secure Connections).
+  // Upstream offered only Legacy Pairing (SC=false); keyboards advertising BT 5.0
+  // often *require* SC and refuse Legacy outright — the GAP link comes up but
+  // pairing is rejected, so the device reports "Connected" while the keyboard
+  // sends nothing and no bond is stored. SC=true fixes that while MITM=false +
+  // NO_INPUT_OUTPUT keeps it "Just Works" (no passkey), so Logitech/Keychron etc.
+  // all still pair without prompting.
+  NimBLEDevice::setSecurityAuth(true, false, true);
   // NO_INPUT_OUTPUT = "Just Works" pairing — works for both Logitech and Keychron
   // since MITM=false means we never require authenticated pairing regardless of IO cap.
   // DISPLAY_YESNO was tried for Keychron but broke Logitech (bond/security-state mismatch
@@ -591,9 +678,17 @@ void bleSetup() {
   // and which caused bond-validation failures after the security param change.
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
-  NimBLEDevice::setPower(-9);  // -9dBm — lowest verified working power level
 
   prefs.begin("ble_kb", false);
+
+  // TX power: restore saved level (default -9 dBm). Applied after prefs opens so
+  // the user's Settings -> BLE Power choice survives reboots.
+  int8_t savedTx = prefs.getChar("tx_power", -9);
+  g_txPowerIdx = 0;
+  for (int i = 0; i < kTxPowerStepCount; i++) {
+    if (kTxPowerSteps[i] == savedTx) { g_txPowerIdx = i; break; }
+  }
+  applyBleTxPower();
 
   // Restore from SD backup if NVS was wiped (e.g. after a firmware flash)
   if (!prefs.isKey("kb_count")) restoreBleBackup();
@@ -623,6 +718,19 @@ void bleSetup() {
     }
   }
 
+  // Clear possibly-stale cross-session bonds ONCE per boot, before any connect. After an
+  // unclean shutdown a keyboard's old bond can leave NimBLE in a security state that
+  // crashes on the next encrypted reconnect. We wipe stored bonds here at startup and
+  // then never delete them again this session (see bleConnectTask) — so the fresh bond
+  // from the first connect is reused for fast, reliable in-session reconnects.
+  {
+    int n = nvs_loadCount();
+    for (int i = 0; i < n; i++) {
+      std::string a = nvs_loadAddr(i);
+      if (!a.empty()) NimBLEDevice::deleteBond(NimBLEAddress(a, nvs_loadType(i)));
+    }
+  }
+
   // Prime auto-reconnect: start with last-used keyboard, give it 5s before first attempt
   // so the keyboard's supervision timeout from the previous session has time to expire.
   int pairedCount = nvs_loadCount();
@@ -643,6 +751,14 @@ void bleSetup() {
 }
 
 void bleLoop() {
+  // Flush a deferred SD backup requested by the ble_conn task (first-time pairing).
+  // Runs here on the main task so it can never overlap an e-ink refresh on the
+  // shared SPI bus. Wait until the connect task has fully exited.
+  if (bleBackupPending && connectTaskHandle == nullptr) {
+    bleBackupPending = false;
+    writeBleBackup();
+  }
+
   // Detect when a one-shot scan finishes
   if (isScanning && !NimBLEDevice::getScan()->isScanning()) {
     isScanning = false;
@@ -651,6 +767,20 @@ void bleLoop() {
     // Trigger screen refresh to show final results
     extern bool screenDirty;
     screenDirty = true;
+  }
+
+  // Recover from a wedged connect task: if it has run far longer than its own internal
+  // timeouts allow (10s connect + 5s auth + discovery), assume the NimBLE host stalled
+  // and release the gate so auto-reconnect can try again instead of the keyboard staying
+  // dead until reboot. Best-effort: we can't safely kill the task mid-call, but it
+  // self-deletes when it eventually unwinds, and the main loop keeps running meanwhile.
+  if (connectTaskHandle != nullptr && bleState != BLEState::CONNECTED
+      && millis() - connectTaskStartMs > CONNECT_TASK_TIMEOUT_MS) {
+    DBG_PRINTLN("[BLE] Connect task exceeded 30s — assuming wedged, resetting state");
+    connectTaskHandle = nullptr;       // release the reconnect gate
+    bleState = BLEState::DISCONNECTED;
+    if (pClient && pClient->isConnected()) pClient->disconnect();
+    lastReconnectAttempt = millis();
   }
 
   // Launch connect task if requested (non-blocking)
@@ -670,6 +800,7 @@ void bleLoop() {
         int idx = reconnectKeyboardIndex % count;
         keyboardAddress = nvs_loadAddr(idx);
         keyboardAddressType = nvs_loadType(idx);
+        nextConnectTimeoutMs = RECONNECT_CONNECT_TIMEOUT_MS;  // release radio fast if absent
         connectToKeyboard = true;
         lastReconnectAttempt = now;
         DBG_PRINTF("[BLE] Auto-reconnect: trying keyboard %d/%d (%s)\n",
@@ -737,6 +868,33 @@ BleDeviceInfo* getDiscoveredDevices() {
   return discoveredDevices.empty() ? nullptr : discoveredDevices.data();
 }
 
+bool bleDeviceIsLikelyKeyboard(const BleDeviceInfo& d) {
+  if (d.isHid) return true;
+  // BLE appearance values: 0x03C0 = Generic HID, 0x03C1 = Keyboard
+  if (d.appearance == 0x03C0 || d.appearance == 0x03C1) return true;
+  return false;
+}
+
+int getVisibleDeviceIndices(bool showAll, int* idxOut, int maxOut,
+                            int* outTotal, int* outKeyboards) {
+  int total = (int)discoveredDevices.size();
+  int kbd = 0;
+  for (auto& d : discoveredDevices) if (bleDeviceIsLikelyKeyboard(d)) kbd++;
+  if (outTotal) *outTotal = total;
+  if (outKeyboards) *outKeyboards = kbd;
+
+  // Fallback: if nothing classified as a keyboard, show everything so the user
+  // can still reach a keyboard that didn't advertise HID before connecting.
+  bool effectiveAll = showAll || (kbd == 0);
+
+  int n = 0;
+  for (int i = 0; i < total && n < maxOut; i++) {
+    if (effectiveAll || bleDeviceIsLikelyKeyboard(discoveredDevices[i]))
+      idxOut[n++] = i;
+  }
+  return n;
+}
+
 void connectToDevice(int deviceIndex) {
   if (deviceIndex < 0 || deviceIndex >= (int)discoveredDevices.size()) {
     DBG_PRINTLN("[BLE] Invalid device index");
@@ -751,6 +909,7 @@ void connectToDevice(int deviceIndex) {
 
   keyboardAddress = discoveredDevices[deviceIndex].address;
   keyboardAddressType = discoveredDevices[deviceIndex].addressType;
+  nextConnectTimeoutMs = CONNECT_TIMEOUT_MS;   // user-initiated pairing: allow full time
   connectToKeyboard = true;
 
   DBG_PRINTF("[BLE] Will connect to: %s type=%d (%s)\n",
@@ -846,6 +1005,7 @@ void connectToPairedKeyboard(int index) {
   prefs.putUChar("last_kb", (uint8_t)index);
   reconnectKeyboardIndex = (count > 1) ? (index + 1) % count : 0;
   reconnectDelay = 5000;
+  nextConnectTimeoutMs = CONNECT_TIMEOUT_MS;   // user-initiated: allow full time
   connectToKeyboard = true;
   DBG_PRINTF("[BLE] Switching to paired keyboard %d: %s\n", index, keyboardAddress.c_str());
   writeBleBackup();
@@ -880,7 +1040,11 @@ void storePairedDevice(const std::string& address, const std::string& name) {
   prefs.putUChar("last_kb", (uint8_t)idx);
   DBG_PRINTF("[BLE] Stored new paired keyboard slot %d: %s (%s)\n",
              idx, name.c_str(), address.c_str());
-  writeBleBackup();
+  // Do NOT write the SD backup here: this function runs inside the ble_conn task
+  // during a first-time pairing, while the main task may be mid e-ink refresh.
+  // The SD card and display share the SPI bus, and concurrent access from two
+  // tasks corrupts the bus and crashes the device. Defer to bleLoop() (main task).
+  bleBackupPending = true;
 }
 
 bool getStoredDevice(std::string& address, std::string& name) {

@@ -13,16 +13,40 @@ int editorGetCursorPosition();
 
 // Editing operations
 void editorInsertChar(char c);
+void editorInsertText(const char* text);
 void editorDeleteChar();     // Backspace
 void editorDeleteForward();  // Delete key
 
-// Cursor movement
-void editorMoveCursorLeft();
-void editorMoveCursorRight();
-void editorMoveCursorUp();
-void editorMoveCursorDown();
-void editorMoveCursorHome();
-void editorMoveCursorEnd();
+// Cursor movement. extend=true keeps an anchor so the range between the anchor
+// and the cursor becomes the selection (Shift+arrow). extend=false collapses an
+// existing selection: Left/Right jump to its edge and stop; the others drop the
+// selection and move from the caret.
+void editorMoveCursorLeft(bool extend = false);
+void editorMoveCursorRight(bool extend = false);
+void editorMoveCursorUp(bool extend = false);
+void editorMoveCursorDown(bool extend = false);
+void editorMoveCursorHome(bool extend = false);
+void editorMoveCursorEnd(bool extend = false);
+
+// Selection + clipboard. Selection is empty when anchor == cursor; the range is a
+// half-open byte interval [lo, hi) on character boundaries. The clipboard is
+// internal to the device and survives opening/creating another note.
+void editorSelectAll();
+bool editorHasSelection();
+bool editorGetSelectionRange(int* lo, int* hi);
+void editorCopy();
+void editorCut();
+void editorPaste();
+
+// Find the next occurrence of `query` (plain byte match, UTF-8 safe) starting
+// from the cursor, wrapping to the top. On a hit, selects the match and scrolls
+// to it; returns true. No match (or empty query) returns false and changes nothing.
+bool editorFindNext(const char* query);
+
+// Set when a newline is inserted (a paragraph break) — used by the autosave to
+// flush at natural boundaries. Peek with Has…, clear when a save consumes it.
+bool editorHasParagraphBreakPending();
+void editorClearParagraphBreak();
 
 // Line/viewport management
 void editorSetCharsPerLine(int cpl);

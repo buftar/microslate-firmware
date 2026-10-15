@@ -3,6 +3,7 @@
 #include "file_manager.h"
 #include "ble_keyboard.h"
 #include "wifi_sync.h"
+#include "keyboard_layout.h"
 
 #include <Arduino.h>
 #include <SDCardManager.h>
@@ -15,6 +16,7 @@ extern bool deleteConfirmPending;
 extern WritingMode writingMode;
 extern FontSize fontSize;
 extern bool showWordCount;
+extern KeyboardLayout currentKeyboardLayout;
 
 // External functions
 void storePairedDevice(const std::string& address, const std::string& name);
@@ -51,12 +53,17 @@ extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
 extern int bluetoothDeviceSelection;
+extern bool btShowAllDevices;
 extern int pairedKeyboardSelection;
+extern bool pairedForgetPending;
 extern Orientation currentOrientation;
 extern int charsPerLine;
 extern bool screenDirty;
 extern char renameBuffer[];
 extern int renameBufferLen;
+extern bool editorFindMode;
+extern char findBuffer[];
+extern int findBufferLen;
 
 void inputSetup() {
   queueHead = 0;
@@ -94,49 +101,53 @@ static KeyEvent dequeueKeyEvent() {
 }
 
 char hidToAscii(uint8_t hid, uint8_t modifiers) {
-  bool shifted = isShift(modifiers) ^ capsLockOn;
+  const char* text = keyboardLayoutQwertyText(hid, modifiers, capsLockOn);
+  if (!text || text[0] == '\0' || text[1] != '\0') return 0;
+  return text[0];
+}
 
-  // Letters a-z (HID 0x04-0x1D)
-  if (hid >= 0x04 && hid <= 0x1D) {
-    char base = 'a' + (hid - 0x04);
-    return shifted ? (base - 32) : base;
+// Handle the in-document find overlay. Enter searches / finds next, Esc closes,
+// Backspace edits the query, printable keys extend it.
+static void handleFindKey(uint8_t keyCode, uint8_t modifiers) {
+  if (keyCode == HID_KEY_ESCAPE) {
+    editorFindMode = false;
+    screenDirty = true;
+    return;
   }
-
-  // Number row (HID 0x1E-0x27)
-  static const char unshifted[] = "1234567890";
-  static const char shiftedNum[] = "!@#$%^&*()";
-  if (hid >= 0x1E && hid <= 0x27) {
-    int idx = hid - 0x1E;
-    return isShift(modifiers) ? shiftedNum[idx] : unshifted[idx];
+  if (keyCode == HID_KEY_ENTER) {
+    if (findBufferLen > 0) editorFindNext(findBuffer);
+    screenDirty = true;
+    return;
   }
-
-  // Special keys
-  switch (hid) {
-    case 0x28: return '\n';  // Enter
-    case 0x2B: return '\t';  // Tab
-    case 0x2C: return ' ';   // Space
-
-    // Symbol keys
-    case 0x2D: return isShift(modifiers) ? '_' : '-';
-    case 0x2E: return isShift(modifiers) ? '+' : '=';
-    case 0x2F: return isShift(modifiers) ? '{' : '[';
-    case 0x30: return isShift(modifiers) ? '}' : ']';
-    case 0x31: return isShift(modifiers) ? '|' : '\\';
-    case 0x33: return isShift(modifiers) ? ':' : ';';
-    case 0x34: return isShift(modifiers) ? '"' : '\'';
-    case 0x35: return isShift(modifiers) ? '~' : '`';
-    case 0x36: return isShift(modifiers) ? '<' : ',';
-    case 0x37: return isShift(modifiers) ? '>' : '.';
-    case 0x38: return isShift(modifiers) ? '?' : '/';
-
-    default: return 0;
+  if (keyCode == HID_KEY_BACKSPACE) {
+    if (findBufferLen > 0) {
+      findBufferLen--;
+      findBuffer[findBufferLen] = '\0';
+    }
+    screenDirty = true;
+    return;
+  }
+  const char* text = keyboardLayoutText(currentKeyboardLayout, keyCode, modifiers, capsLockOn);
+  if (text != nullptr) {
+    int tlen = (int)strlen(text);
+    if (findBufferLen + tlen < MAX_FIND_LEN) {
+      strcpy(findBuffer + findBufferLen, text);
+      findBufferLen += tlen;
+    }
+    screenDirty = true;
   }
 }
 
 // Handle text editor input
 static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
+  // Find overlay takes over input while active.
+  if (editorFindMode) {
+    handleFindKey(keyCode, modifiers);
+    return;
+  }
+
   // Ctrl shortcuts
-  if (isCtrl(modifiers)) {
+  if (isCtrl(modifiers) && !isAltGr(modifiers)) {
     if (keyCode == HID_KEY_S) {
       saveCurrentFile();
       screenDirty = true;
@@ -157,8 +168,11 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
       return;
     }
     if (keyCode == HID_KEY_F) {
-      int v = static_cast<int>(fontSize);
-      fontSize = static_cast<FontSize>((v + 1) % 3);
+      // Enter find mode. (Font size moved here historically; it stays available
+      // in Settings → Font Size.)
+      editorFindMode = true;
+      findBuffer[0] = '\0';
+      findBufferLen = 0;
       screenDirty = true;
       return;
     }
@@ -167,8 +181,33 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
       screenDirty = true;
       return;
     }
+    if (keyCode == HID_KEY_K) {
+      currentKeyboardLayout = keyboardLayoutNext(currentKeyboardLayout);
+      screenDirty = true;
+      return;
+    }
     if (keyCode == HID_KEY_P) {
       writingMode = (writingMode == WritingMode::PAGINATION) ? WritingMode::NORMAL : WritingMode::PAGINATION;
+      screenDirty = true;
+      return;
+    }
+    // Clipboard: Ctrl+A select all, Ctrl+C copy, Ctrl+X cut, Ctrl+V paste
+    if (keyCode == HID_KEY_A) {
+      editorSelectAll();
+      screenDirty = true;
+      return;
+    }
+    if (keyCode == HID_KEY_C) {
+      editorCopy();
+      return;
+    }
+    if (keyCode == HID_KEY_X) {
+      editorCut();
+      screenDirty = true;
+      return;
+    }
+    if (keyCode == HID_KEY_V) {
+      editorPaste();
       screenDirty = true;
       return;
     }
@@ -205,14 +244,17 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
     return;
   }
 
-  // Navigation keys
+  // Navigation keys. Shift+arrow/Home/End extends the selection (Ctrl already
+  // returned above, so it keeps its own meaning). Backspace/Delete handle an
+  // active selection internally.
+  const bool extend = isShift(modifiers);
   switch (keyCode) {
-    case HID_KEY_LEFT:      editorMoveCursorLeft();  screenDirty = true; return;
-    case HID_KEY_RIGHT:     editorMoveCursorRight(); screenDirty = true; return;
-    case HID_KEY_UP:        editorMoveCursorUp();    screenDirty = true; return;
-    case HID_KEY_DOWN:      editorMoveCursorDown();  screenDirty = true; return;
-    case HID_KEY_HOME:      editorMoveCursorHome();  screenDirty = true; return;
-    case HID_KEY_END:       editorMoveCursorEnd();   screenDirty = true; return;
+    case HID_KEY_LEFT:      editorMoveCursorLeft(extend);  screenDirty = true; return;
+    case HID_KEY_RIGHT:     editorMoveCursorRight(extend); screenDirty = true; return;
+    case HID_KEY_UP:        editorMoveCursorUp(extend);    screenDirty = true; return;
+    case HID_KEY_DOWN:      editorMoveCursorDown(extend);  screenDirty = true; return;
+    case HID_KEY_HOME:      editorMoveCursorHome(extend);  screenDirty = true; return;
+    case HID_KEY_END:       editorMoveCursorEnd(extend);   screenDirty = true; return;
     case HID_KEY_BACKSPACE: editorDeleteChar();      screenDirty = true; return;
     case HID_KEY_DELETE:    editorDeleteForward();   screenDirty = true; return;
   }
@@ -224,9 +266,9 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
   }
 
   // Printable character
-  char c = hidToAscii(keyCode, modifiers);
-  if (c != 0) {
-    editorInsertChar(c);
+  const char* text = keyboardLayoutText(currentKeyboardLayout, keyCode, modifiers, capsLockOn);
+  if (text != nullptr) {
+    editorInsertText(text);
     screenDirty = true;
   }
 }
@@ -354,12 +396,12 @@ static void dispatchEvent(const KeyEvent& event) {
         FileInfo* files = getFileList();
         loadFile(files[selectedFileIndex].filename);
         screenDirty = true;
-      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
+      } else if (isCtrl(event.modifiers) && !isAltGr(event.modifiers) && event.keyCode == HID_KEY_N) {
         if (fc > 0) {
           FileInfo* files = getFileList();
           openTitleEdit(files[selectedFileIndex].title, UIState::FILE_BROWSER);
         }
-      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_D) {
+      } else if (isCtrl(event.modifiers) && !isAltGr(event.modifiers) && event.keyCode == HID_KEY_D) {
         if (fc > 0) {
           deleteConfirmPending = true;
           screenDirty = true;
@@ -380,7 +422,7 @@ static void dispatchEvent(const KeyEvent& event) {
       break;
 
     case UIState::SETTINGS: {
-      const int SETTINGS_COUNT = 6;  // Orientation, Dark Mode, Writing Mode, Font Size, Bluetooth, Paired Keyboards
+      const int SETTINGS_COUNT = 8;  // Orientation, Dark Mode, Writing Mode, Font Size, Layout, BLE Power, Bluetooth, Paired Keyboards
 
       // Up/Down: navigate settings list (physical buttons also map here)
       if (event.keyCode == HID_KEY_DOWN) {
@@ -404,9 +446,16 @@ static void dispatchEvent(const KeyEvent& event) {
           int v = static_cast<int>(fontSize);
           fontSize = static_cast<FontSize>((v + 1) % 3);
         } else if (settingsSelection == 4) {
-          currentState = UIState::BLUETOOTH_SETTINGS;
+          currentKeyboardLayout = keyboardLayoutNext(currentKeyboardLayout);
         } else if (settingsSelection == 5) {
+          cycleBleTxPower(+1);   // more power (adjustable in place, like Font Size)
+        } else if (settingsSelection == 6) {
+          bluetoothDeviceSelection = 0;
+          btShowAllDevices = true;   // default to showing all (see note at definition)
+          currentState = UIState::BLUETOOTH_SETTINGS;
+        } else if (settingsSelection == 7) {
           pairedKeyboardSelection = 0;
+          pairedForgetPending = false;
           currentState = UIState::PAIRED_KEYBOARDS;
         }
         screenDirty = true;
@@ -424,6 +473,10 @@ static void dispatchEvent(const KeyEvent& event) {
         } else if (settingsSelection == 3) {
           int v = static_cast<int>(fontSize);
           fontSize = static_cast<FontSize>((v - 1 + 3) % 3);
+        } else if (settingsSelection == 4) {
+          currentKeyboardLayout = keyboardLayoutPrev(currentKeyboardLayout);
+        } else if (settingsSelection == 5) {
+          cycleBleTxPower(-1);   // less power
         }
         screenDirty = true;
 
@@ -435,45 +488,47 @@ static void dispatchEvent(const KeyEvent& event) {
     }
 
     case UIState::BLUETOOTH_SETTINGS: {
-      int deviceCount = getDiscoveredDeviceCount();
+      // Build the visible list (keyboards first; others only when "show all").
+      // The last selectable row may be the "Show other devices" toggle.
+      int visIdx[32];
+      int total = 0, kbd = 0;
+      int visCount = getVisibleDeviceIndices(btShowAllDevices, visIdx, 32, &total, &kbd);
+      bool toggleShown = (kbd > 0 && total > kbd);   // a real filter choice exists
+      int itemCount = visCount + (toggleShown ? 1 : 0);
 
-      // Ensure selection is within bounds
-      if (bluetoothDeviceSelection >= deviceCount && deviceCount > 0) {
-        bluetoothDeviceSelection = deviceCount - 1;
-      } else if (deviceCount == 0) {
-        bluetoothDeviceSelection = 0; // Reset to 0 when no devices
-      }
+      // Keep selection in range
+      if (itemCount == 0) bluetoothDeviceSelection = 0;
+      else if (bluetoothDeviceSelection >= itemCount) bluetoothDeviceSelection = itemCount - 1;
+      if (bluetoothDeviceSelection < 0) bluetoothDeviceSelection = 0;
+
+      bool onToggle = (toggleShown && bluetoothDeviceSelection == visCount);
 
       if (event.keyCode == HID_KEY_ESCAPE) {
-        DBG_PRINTLN("[INPUT] BT: Escape pressed - returning to settings");
         currentState = UIState::SETTINGS;
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_DOWN) {
-        if (deviceCount > 0) {
-          bluetoothDeviceSelection = (bluetoothDeviceSelection + 1) % deviceCount;
-          DBG_PRINTF("[INPUT] BT: Down pressed - selection now %d/%d\n", bluetoothDeviceSelection, deviceCount);
+        if (itemCount > 0) {
+          bluetoothDeviceSelection = (bluetoothDeviceSelection + 1) % itemCount;
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_UP) {
-        if (deviceCount > 0) {
-          bluetoothDeviceSelection = (bluetoothDeviceSelection - 1 + deviceCount) % deviceCount;
-          DBG_PRINTF("[INPUT] BT: Up pressed - selection now %d/%d\n", bluetoothDeviceSelection, deviceCount);
+        if (itemCount > 0) {
+          bluetoothDeviceSelection = (bluetoothDeviceSelection - 1 + itemCount) % itemCount;
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_ENTER) {
-        if (deviceCount > 0 && !isDeviceScanning()) {
-          // Connect to the selected device
-          connectToDevice(bluetoothDeviceSelection);
+        if (onToggle) {
+          btShowAllDevices = !btShowAllDevices;   // flip filter, reset to top
+          bluetoothDeviceSelection = 0;
+        } else if (visCount > 0 && !isDeviceScanning()) {
+          connectToDevice(visIdx[bluetoothDeviceSelection]);
         } else if (!isDeviceScanning()) {
-          // No devices — start a new scan
-          startDeviceScan();
+          startDeviceScan();   // nothing to connect to — scan instead
         }
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_RIGHT) {
         // Right button = re-scan for devices
-        if (!isDeviceScanning()) {
-          startDeviceScan();
-        }
+        if (!isDeviceScanning()) startDeviceScan();
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_LEFT) {
         if (isKeyboardConnected()) {
@@ -488,30 +543,46 @@ static void dispatchEvent(const KeyEvent& event) {
       int count = getPairedKeyboardCount();
 
       if (event.keyCode == HID_KEY_ESCAPE) {
-        currentState = UIState::SETTINGS;
-        screenDirty = true;
+        if (pairedForgetPending) {
+          pairedForgetPending = false;   // cancel the confirmation, stay on screen
+          screenDirty = true;
+        } else {
+          currentState = UIState::SETTINGS;
+          screenDirty = true;
+        }
       } else if (event.keyCode == HID_KEY_DOWN) {
+        pairedForgetPending = false;     // moving the selection cancels a pending forget
         if (count > 0) {
           pairedKeyboardSelection = (pairedKeyboardSelection + 1) % count;
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_UP) {
+        pairedForgetPending = false;
         if (count > 0) {
           pairedKeyboardSelection = (pairedKeyboardSelection - 1 + count) % count;
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_ENTER) {
         if (count > 0) {
-          connectToPairedKeyboard(pairedKeyboardSelection);
-          currentState = UIState::SETTINGS;
-          screenDirty = true;
+          if (pairedForgetPending) {
+            // Enter confirms the forget
+            removePairedKeyboard(pairedKeyboardSelection);
+            pairedForgetPending = false;
+            int newCount = getPairedKeyboardCount();
+            if (newCount == 0) pairedKeyboardSelection = 0;
+            else if (pairedKeyboardSelection >= newCount)
+              pairedKeyboardSelection = newCount - 1;
+            screenDirty = true;
+          } else {
+            connectToPairedKeyboard(pairedKeyboardSelection);
+            currentState = UIState::SETTINGS;
+            screenDirty = true;
+          }
         }
       } else if (event.keyCode == HID_KEY_D) {
+        // Arm the forget confirmation (Right button on-device, or 'D' on a keyboard)
         if (count > 0) {
-          removePairedKeyboard(pairedKeyboardSelection);
-          int newCount = getPairedKeyboardCount();
-          if (pairedKeyboardSelection >= newCount && newCount > 0)
-            pairedKeyboardSelection = newCount - 1;
+          pairedForgetPending = true;
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_LEFT) {

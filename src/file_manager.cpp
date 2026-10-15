@@ -2,7 +2,10 @@
 #include "text_editor.h"
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <Preferences.h>
 #include <cstring>
+#include <ctime>
+#include <sys/time.h>
 
 // --- File list ---
 static FileInfo fileList[MAX_FILES];
@@ -10,6 +13,43 @@ static int fileCount = 0;
 
 // Shared state
 extern UIState currentState;
+
+// --- Monotonic clock for file timestamps ---------------------------------
+// The X4 has no RTC, so without this every file would get SdFat's identical
+// default stamp and the browser couldn't tell new notes from old. We keep a
+// coarse clock seeded from a persisted epoch that only ever moves forward:
+// every save stamps the file with time(nullptr) and persists it, so after a
+// reboot the clock resumes just past the last save. That makes each newly
+// saved note strictly newer than everything before it — enough to sort by.
+static Preferences clockPrefs;
+// Seed is a pure relative-ordering sentinel (no UI shows dates). It must sit
+// ABOVE any plausible firmware build date, because legacy notes written by
+// older builds carry that build's compile-date stamp (~2026) — if the seed
+// were lower, those old files would outrank fresh saves and stick to the top.
+static constexpr unsigned long CLOCK_DEFAULT_EPOCH = 1900000000UL;  // ~2030-03
+
+// SdFat calls this whenever it creates or syncs a file's directory entry.
+static void sdDateTimeCallback(uint16_t* date, uint16_t* timeOut) {
+  time_t now = time(nullptr);
+  struct tm t;
+  localtime_r(&now, &t);
+  *date = FS_DATE(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  *timeOut = FS_TIME(t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+static void clockInit() {
+  clockPrefs.begin("clock", false);
+  unsigned long base = clockPrefs.getULong("base", CLOCK_DEFAULT_EPOCH);
+  if (base < CLOCK_DEFAULT_EPOCH) base = CLOCK_DEFAULT_EPOCH;
+  struct timeval tv = { (time_t)base, 0 };
+  settimeofday(&tv, nullptr);
+  FsDateTime::setCallback(sdDateTimeCallback);
+}
+
+// Persist the advancing clock so timestamps stay monotonic across reboots.
+static void clockPersist() {
+  clockPrefs.putULong("base", (unsigned long)time(nullptr));
+}
 
 // Convert filename to a readable display title.
 // "my_note_2.txt" -> "My Note 2"
@@ -76,12 +116,62 @@ void fileManagerSetup() {
     return;
   }
 
+  clockInit();          // seed monotonic clock + register SdFat timestamp callback
+
   if (!SdMan.exists("/notes")) {
     SdMan.mkdir("/notes");
   }
 
+  recoverTempFiles();   // reconcile any .tmp left by a crash mid-save
+
   DBG_PRINTLN("SD Card initialized");
   refreshFileList();
+}
+
+void recoverTempFiles() {
+  if (!SdMan.exists("/notes")) return;
+  auto root = SdMan.open("/notes");
+  if (!root || !root.isDirectory()) { if (root) root.close(); return; }
+
+  // Collect .tmp names first — renaming/removing during directory iteration is unsafe.
+  char tmpNames[16][MAX_FILENAME_LEN + 8];
+  int n = 0;
+  root.rewindDirectory();
+  char name[256];
+  for (auto f = root.openNextFile(); f; f = root.openNextFile()) {
+    f.getName(name, sizeof(name));
+    int len = (int)strlen(name);
+    if (len > 4 && strcasecmp(name + len - 4, ".tmp") == 0 && n < 16) {
+      strncpy(tmpNames[n], name, sizeof(tmpNames[0]) - 1);
+      tmpNames[n][sizeof(tmpNames[0]) - 1] = '\0';
+      n++;
+    }
+    f.close();
+  }
+  root.close();
+
+  for (int i = 0; i < n; i++) {
+    char real[MAX_FILENAME_LEN + 8];
+    strncpy(real, tmpNames[i], sizeof(real) - 1);
+    real[sizeof(real) - 1] = '\0';
+    int rl = (int)strlen(real);
+    if (rl > 4) real[rl - 4] = '\0';   // strip ".tmp"
+
+    char tmpPath[320], realPath[320];
+    snprintf(tmpPath, sizeof(tmpPath), "/notes/%s", tmpNames[i]);
+    snprintf(realPath, sizeof(realPath), "/notes/%s", real);
+
+    if (SdMan.exists(realPath)) {
+      // Original intact → the .tmp is a stale partial from a crash before the swap.
+      SdMan.remove(tmpPath);
+      DBG_PRINTF("[recover] removed stale %s\n", tmpNames[i]);
+    } else {
+      // Original missing → crash between rotate and rename; the verified .tmp is the
+      // newest good content. Promote it (previous version is still in .bak as backup).
+      SdMan.rename(tmpPath, realPath);
+      DBG_PRINTF("[recover] promoted %s -> %s\n", tmpNames[i], real);
+    }
+  }
 }
 
 void refreshFileList() {
@@ -110,13 +200,29 @@ void refreshFileList() {
       fileList[fileCount].filename[MAX_FILENAME_LEN - 1] = '\0';
 
       filenameToTitle(name, fileList[fileCount].title, MAX_TITLE_LEN);
-      fileList[fileCount].modTime = 0;
+
+      // Pack the FAT modify date/time into a single comparable key (date is
+      // the high half so it dominates the ordering).
+      uint16_t d = 0, t = 0;
+      file.getModifyDateTime(&d, &t);
+      fileList[fileCount].modTime = ((unsigned long)d << 16) | t;
       fileCount++;
     }
     file.close();
   }
   root.close();
   SdMan.sleep();
+
+  // Sort newest-first (insertion sort — MAX_FILES is small).
+  for (int i = 1; i < fileCount; i++) {
+    FileInfo key = fileList[i];
+    int j = i - 1;
+    while (j >= 0 && fileList[j].modTime < key.modTime) {
+      fileList[j + 1] = fileList[j];
+      j--;
+    }
+    fileList[j + 1] = key;
+  }
 
   DBG_PRINTF("File listing: %d files found\n", fileCount);
 }
@@ -191,6 +297,7 @@ void saveCurrentFile(bool refreshList) {
   SdMan.rename(tmpPath, path);
 
   editorSetUnsavedChanges(false);
+  clockPersist();   // keep timestamps monotonic across reboots
   if (refreshList) refreshFileList();
   SdMan.sleep();
   DBG_PRINTF("Saved: %s\n", filename);
