@@ -138,6 +138,8 @@ void switchToOtaApp(int index) {
   DBG_PRINTF("[OTA] Switching to \"%s\" (subtype %d)...\n", otaApps[index].name, subtype);
 
   // Raw otadata switch (ported from CrossInk's ota_boot::switchTo, src/network/OtaBootSwitch.cpp).
+  // shortcut: hand copy without CrossInk's host test (this IDF 4.4 tree has no test harness); keep in sync
+  // with CrossInk by hand, and share the file if this branch moves to IDF 5 / upstream v3.
   // esp_ota_set_boot_partition() wraps esp_image_verify which is unreliable on X3 silicon
   // (bogus efuse-blk-rev errors on valid images). Write otadata directly.
   //
