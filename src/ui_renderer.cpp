@@ -4,6 +4,7 @@
 #include "file_manager.h"
 #include "ble_keyboard.h"
 #include "wifi_sync.h"
+#include "keyboard_layout.h"
 
 #include <GfxRenderer.h>
 #include <HalGPIO.h>
@@ -19,6 +20,7 @@ extern bool deleteConfirmPending;
 extern WritingMode writingMode;
 extern FontSize fontSize;
 extern bool showWordCount;
+extern KeyboardLayout currentKeyboardLayout;
 
 // External functions
 uint32_t getCurrentPasskey();
@@ -89,11 +91,15 @@ extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
 extern int bluetoothDeviceSelection;
+extern bool btShowAllDevices;
 extern int pairedKeyboardSelection;
+extern bool pairedForgetPending;
 extern Orientation currentOrientation;
 extern int charsPerLine;
 extern char renameBuffer[];
 extern int renameBufferLen;
+extern bool editorFindMode;
+extern char findBuffer[];
 
 void rendererSetup(GfxRenderer& renderer) {
   renderer.insertFont(FONT_LARGE, ns16Family);
@@ -289,7 +295,7 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
 
 // Helper: draw a single editor line from the buffer
 static void drawEditorLine(GfxRenderer& renderer, int lineIdx, int x, int yPos,
-                           int maxW, bool tc) {
+                           int lineHeight, int maxW, bool tc) {
   char* buf = editorGetBuffer();
   size_t bufLen = editorGetLength();
   int totalLines = editorGetLineCount();
@@ -300,12 +306,39 @@ static void drawEditorLine(GfxRenderer& renderer, int lineIdx, int x, int yPos,
   if (dispEnd > lineStart && buf[dispEnd - 1] == '\n') dispEnd--;
 
   int len = dispEnd - lineStart;
-  if (len > 0) {
-    char lineBuf[256];
-    int copyLen = (len < (int)sizeof(lineBuf) - 1) ? len : (int)sizeof(lineBuf) - 1;
-    strncpy(lineBuf, buf + lineStart, copyLen);
-    lineBuf[copyLen] = '\0';
-    drawClippedText(renderer, editorFontId(fontSize), x, yPos, lineBuf, maxW, tc);
+  if (len <= 0) return;
+
+  char lineBuf[512];
+  int copyLen = (len < (int)sizeof(lineBuf) - 1) ? len : (int)sizeof(lineBuf) - 1;
+  strncpy(lineBuf, buf + lineStart, copyLen);
+  lineBuf[copyLen] = '\0';
+
+  int fontId = editorFontId(fontSize);
+
+  // Draw the line normally first.
+  drawClippedText(renderer, fontId, x, yPos, lineBuf, maxW, tc);
+
+  // Overlay the selection on this line as inverse video, if any overlaps it.
+  int selLo, selHi;
+  if (editorGetSelectionRange(&selLo, &selHi)) {
+    int a = (selLo > lineStart) ? selLo : lineStart;       // clamp to line
+    int b = (selHi < dispEnd)  ? selHi : dispEnd;
+    int aOff = a - lineStart;
+    int bOff = b - lineStart;
+    if (aOff < 0) aOff = 0;
+    if (bOff > copyLen) bOff = copyLen;
+    if (bOff > aOff) {
+      char pre[512], sel[512];
+      strncpy(pre, lineBuf, aOff); pre[aOff] = '\0';
+      int selLen = bOff - aOff;
+      strncpy(sel, lineBuf + aOff, selLen); sel[selLen] = '\0';
+      int xA = x + renderer.getTextAdvanceX(fontId, pre);
+      int selW = renderer.getTextAdvanceX(fontId, sel);
+      // Solid block in the text colour, then the selected text in the background
+      // colour on top → inverse video.
+      clippedFillRect(renderer, xA, yPos, selW, lineHeight, tc);
+      drawClippedText(renderer, fontId, xA, yPos, sel, maxW - (xA - x), !tc);
+    }
   }
 }
 
@@ -313,12 +346,17 @@ static void drawEditorLine(GfxRenderer& renderer, int lineIdx, int x, int yPos,
 static void drawEditorCursor(GfxRenderer& renderer, int cursorY, int lineHeight,
                              int sw, bool tc) {
   int curLine = editorGetCursorLine();
-  int curCol = editorGetCursorCol();
+  int curPos = editorGetCursorPosition();
   char* buf = editorGetBuffer();
 
   int lineStart = editorGetLinePosition(curLine);
-  char prefix[256];
-  int prefixLen = (curCol < (int)sizeof(prefix) - 1) ? curCol : (int)sizeof(prefix) - 1;
+  char prefix[512];
+  int prefixLen = curPos - lineStart;
+  if (prefixLen < 0) prefixLen = 0;
+  if (prefixLen > (int)sizeof(prefix) - 1) prefixLen = (int)sizeof(prefix) - 1;
+  while (prefixLen > 0 && ((static_cast<unsigned char>(buf[lineStart + prefixLen]) & 0xC0) == 0x80)) {
+    prefixLen--;
+  }
   strncpy(prefix, buf + lineStart, prefixLen);
   prefix[prefixLen] = '\0';
 
@@ -360,15 +398,26 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
   int modeX = sw - 70 - modeW;
   drawClippedText(renderer, FONT_SMALL, modeX, 5, modeInd, modeW + 5, tc);
 
-  // Word count — drawn to the left of the mode indicator
-  int titleMaxW = modeX - 10;
+  // Layout indicator — shown to the left of the mode indicator when non-QWERTY
+  // so the user always knows which layout Ctrl+K will toggle away from.
+  int layoutIndX = modeX - 8;
+  if (currentKeyboardLayout != KeyboardLayout::QWERTY) {
+    const char* layoutInd = keyboardLayoutShortName(currentKeyboardLayout);
+    int layoutW = renderer.getTextAdvanceX(FONT_SMALL, layoutInd);
+    layoutIndX = modeX - 8 - layoutW;
+    if (layoutIndX > 10)
+      drawClippedText(renderer, FONT_SMALL, layoutIndX, 5, layoutInd, layoutW + 5, tc);
+  }
+
+  // Word count — drawn to the left of the layout indicator (or mode indicator)
+  int titleMaxW = layoutIndX - 10;
   if (showWordCount) {
     int wc = editorGetWordCount();
     char wcBuf[24];
     if (wc == 1) snprintf(wcBuf, sizeof(wcBuf), "1 word");
     else         snprintf(wcBuf, sizeof(wcBuf), "%d words", wc);
     int wcW = renderer.getTextAdvanceX(FONT_SMALL, wcBuf);
-    int wcX = modeX - 8 - wcW;
+    int wcX = layoutIndX - 8 - wcW;
     if (wcX > 10) {
       drawClippedText(renderer, FONT_SMALL, wcX, 5, wcBuf, wcW + 5, tc);
       titleMaxW = wcX - 10;
@@ -387,6 +436,19 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
   return 38;
+}
+
+// Bottom overlay bar showing the current find query. Drawn over the editor while
+// find mode is active (the matched text itself highlights via the selection).
+static void drawFindBar(GfxRenderer& renderer, int sw, int sh, bool tc) {
+  int barH = renderer.getLineHeight(FONT_UI) + 10;
+  int barY = sh - barH;
+  clippedFillRect(renderer, 0, barY, sw, barH, !tc);   // clear to background
+  clippedLine(renderer, 0, barY, sw, barY, tc);        // top divider
+  char line[72];
+  snprintf(line, sizeof(line), "Find: %s", findBuffer);
+  drawClippedText(renderer, FONT_UI, 8, barY + 5, line, sw - 100, tc);
+  drawRightText(renderer, FONT_SMALL, sw - 8, barY + 7, "Enter:Next Esc:Close", tc);
 }
 
 void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
@@ -412,7 +474,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
 
     // Draw only the current line
     if (curLine < totalLines) {
-      drawEditorLine(renderer, curLine, 10, centerY, sw - 20, tc);
+      drawEditorLine(renderer, curLine, 10, centerY, lineHeight, sw - 20, tc);
     }
 
     // Draw cursor
@@ -420,6 +482,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
 
     editorSetVisibleLines(1);
 
+    if (editorFindMode) drawFindBar(renderer, sw, sh, tc);
     renderer.beginRefresh(HalDisplay::FAST_REFRESH);
     return;
   }
@@ -453,7 +516,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
     // Draw lines for this page
     for (int i = 0; i < linesPerPage && (pageStart + i) < totalLines; i++) {
       int yPos = textAreaTop + (i * lineHeight);
-      drawEditorLine(renderer, pageStart + i, 10, yPos, sw - 20, tc);
+      drawEditorLine(renderer, pageStart + i, 10, yPos, lineHeight, sw - 20, tc);
     }
 
     // Draw cursor if on this page
@@ -462,6 +525,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
       drawEditorCursor(renderer, cursorY, lineHeight, sw, tc);
     }
 
+    if (editorFindMode) drawFindBar(renderer, sw, sh, tc);
     renderer.beginRefresh(HalDisplay::FAST_REFRESH);
     return;
   }
@@ -476,13 +540,11 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
   editorSetVisibleLines(visibleLines);
 
   int vpStart = editorGetViewportStart();
-  char* buf = editorGetBuffer();
-  size_t bufLen = editorGetLength();
 
   // Draw visible lines
   for (int i = 0; i < visibleLines && (vpStart + i) < totalLines; i++) {
     int yPos = textAreaTop + (i * lineHeight);
-    drawEditorLine(renderer, vpStart + i, 10, yPos, sw - 20, tc);
+    drawEditorLine(renderer, vpStart + i, 10, yPos, lineHeight, sw - 20, tc);
   }
 
   // Draw cursor
@@ -491,6 +553,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
     drawEditorCursor(renderer, cursorY, lineHeight, sw, tc);
   }
 
+  if (editorFindMode) drawFindBar(renderer, sw, sh, tc);
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
 }
 
@@ -505,18 +568,25 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
 
-  drawClippedText(renderer, FONT_SMALL, 20, 42, "Note title: ", 0, tc);
-  int boxY = 64, boxH = 36;
-  int textY = boxY + 8;
+  drawClippedText(renderer, FONT_SMALL, 20, 42, "Note title:", 0, tc);
+  // Auto-size the input box to the text line height with even padding, so the
+  // text and caret are vertically centred and never touch the border.
+  int lineH = renderer.getLineHeight(FONT_UI);
+  if (lineH <= 0) lineH = 18;
+  constexpr int pad = 6;
+  int boxY = 64;
+  int boxH = lineH + pad * 2;
+  int textY = boxY + pad;
   renderer.drawRect(15, boxY, sw - 30, boxH, tc);
   drawClippedText(renderer, FONT_UI, 20, textY, renameBuffer, sw - 50, tc);
 
-  // Cursor — thin bar aligned with text
+  // Caret — same height as the text line, inset by the box padding
   int cursorX = 20 + renderer.getTextAdvanceX(FONT_UI, renameBuffer);
-  int cursorH = renderer.getLineHeight(FONT_UI);
-  if (cursorH <= 0) cursorH = 16;
   if (cursorX + 2 < sw - 15)
-    renderer.fillRect(cursorX, textY, 2, cursorH, tc);
+    renderer.fillRect(cursorX, textY, 2, lineH, tc);
+
+  drawClippedText(renderer, FONT_SMALL, 20, boxY + boxH + 8,
+                  "File title input uses US QWERTY", sw - 40, tc);
 
   // Footer
   int footerH = footerHeight(renderer);
@@ -536,11 +606,11 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, !darkMode);
 
-  // Setting items: Orientation, Dark Mode, Writing Mode, Font Size, Bluetooth, Paired Keyboards
+  // Setting items: Orientation, Dark Mode, Writing Mode, Font Size, Layout, BLE Power, Bluetooth, Paired Keyboards
   static const char* labels[] = {
-    "Orientation", "Dark Mode", "Writing Mode", "Font Size", "Bluetooth", "Paired Keyboards"
+    "Orientation", "Dark Mode", "Writing Mode", "Font Size", "Keyboard Layout", "BLE Power", "Bluetooth", "Paired Keyboards"
   };
-  const int SETTINGS_COUNT = 6;
+  const int SETTINGS_COUNT = 8;
 
   // Compute line height to fit all items — use smaller spacing if needed
   int lineH = renderer.getLineHeight(FONT_UI) + 10;
@@ -584,7 +654,13 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
         case FontSize::MEDIUM: strcpy(val, "Medium"); break;
         default:               strcpy(val, "Large"); break;
       }
+    } else if (i == 4) {
+      strncpy(val, keyboardLayoutName(currentKeyboardLayout), sizeof(val) - 1);
+      val[sizeof(val) - 1] = '\0';
     } else if (i == 5) {
+      strncpy(val, getBleTxPowerLabel(), sizeof(val) - 1);
+      val[sizeof(val) - 1] = '\0';
+    } else if (i == 7) {
       int kbCount = getPairedKeyboardCount();
       if (kbCount == 0) strcpy(val, "None");
       else if (kbCount == 1) strcpy(val, "1 keyboard");
@@ -677,62 +753,84 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
     headY += smallRowH;
   }
 
-  // Device list
-  int deviceCount = getDiscoveredDeviceCount();
-  if (deviceCount > 0) {
+  // Device list — keyboards first; non-keyboards hidden behind a toggle row.
+  int visIdx[32];
+  int total = 0, kbd = 0;
+  int visCount = getVisibleDeviceIndices(btShowAllDevices, visIdx, 32, &total, &kbd);
+  bool toggleShown = (kbd > 0 && total > kbd);
+  int itemCount = visCount + (toggleShown ? 1 : 0);
+
+  if (total > 0) {
     BleDeviceInfo* devices = getDiscoveredDevices();
 
-    char headerStr[64];
-    snprintf(headerStr, sizeof(headerStr), "Available devices: %d", deviceCount);
-    drawClippedText(renderer, FONT_SMALL, 10, headY, headerStr, 0, tc, EpdFontFamily::BOLD);
-    headY += smallRowH;
-
-    // Show up to 10 devices (pagination via scrolling)
-    int maxDevicesToShow = 10;
-    int startIndex = 0;
-    if (bluetoothDeviceSelection >= maxDevicesToShow) {
-      startIndex = bluetoothDeviceSelection - maxDevicesToShow + 1;
+    // Count header (hidden while scanning to avoid colliding with "Found: N").
+    if (!isDeviceScanning()) {
+      char headerStr[64];
+      if (btShowAllDevices || kbd == 0)
+        snprintf(headerStr, sizeof(headerStr), "Devices: %d", total);
+      else
+        snprintf(headerStr, sizeof(headerStr), "Keyboards: %d", visCount);
+      drawClippedText(renderer, FONT_SMALL, 10, headY, headerStr, 0, tc, EpdFontFamily::BOLD);
+      headY += smallRowH;
     }
-    int devicesToShow = (deviceCount - startIndex < maxDevicesToShow)
-                        ? deviceCount - startIndex : maxDevicesToShow;
 
-    for (int i = 0; i < devicesToShow; i++) {
-      int deviceIndex = startIndex + i;
-      int yPos = headY + (i * rowHeight(renderer, FONT_UI));
+    int sel = bluetoothDeviceSelection;
+    if (sel >= itemCount) sel = itemCount - 1;
+    if (sel < 0) sel = 0;
+    const int rowH = rowHeight(renderer, FONT_UI);
+    const int hlH = renderer.getLineHeight(FONT_UI) + 10;
 
-      // Stop drawing if we'd go into the footer zone
-      if (yPos > sh - 100) break;
+    // Show up to 10 rows (pagination via scrolling)
+    int maxToShow = 10;
+    int startIndex = (sel >= maxToShow) ? sel - maxToShow + 1 : 0;
+    int itemsToShow = (itemCount - startIndex < maxToShow) ? itemCount - startIndex : maxToShow;
 
-      bool isSelected = (bluetoothDeviceSelection == deviceIndex);
-      bool isConnected = (getCurrentDeviceAddress() == devices[deviceIndex].address);
+    for (int i = 0; i < itemsToShow; i++) {
+      int pos = startIndex + i;
+      int yPos = headY + (i * rowH);
+      if (yPos > sh - 100) break;   // don't draw into the footer zone
 
-      const char* displayName = devices[deviceIndex].name.empty()
-                                ? devices[deviceIndex].address.c_str()
-                                : devices[deviceIndex].name.c_str();
+      bool isSel = (sel == pos);
 
-      // Available width: leave room for RSSI on the right (~80px)
-      int nameMaxW = sw - 100;
-
-      if (isSelected || isConnected) {
-        clippedFillRect(renderer, 5, yPos - 5, sw - 10, renderer.getLineHeight(FONT_UI) + 10, tc);
-        drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, !tc);
+      if (pos < visCount) {
+        int d = visIdx[pos];
+        bool isConnected = (getCurrentDeviceAddress() == devices[d].address);
+        const char* displayName = devices[d].name.empty()
+                                  ? devices[d].address.c_str()
+                                  : devices[d].name.c_str();
+        int nameMaxW = sw - 100;   // leave room for RSSI
+        if (isSel || isConnected) {
+          clippedFillRect(renderer, 5, yPos - 5, sw - 10, hlH, tc);
+          drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, !tc);
+        } else {
+          drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, tc);
+        }
+        char rssiStr[16];
+        snprintf(rssiStr, sizeof(rssiStr), "%ddBm", devices[d].rssi);
+        drawRightText(renderer, FONT_SMALL, sw - 10, yPos, rssiStr, (isSel || isConnected) ? !tc : tc);
       } else {
-        drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, tc);
+        // The "Show other devices" / "Show keyboards only" toggle row
+        char toggleStr[40];
+        if (btShowAllDevices)
+          snprintf(toggleStr, sizeof(toggleStr), "Show keyboards only");
+        else
+          snprintf(toggleStr, sizeof(toggleStr), "Show other devices (%d)", total - kbd);
+        if (isSel) {
+          clippedFillRect(renderer, 5, yPos - 5, sw - 10, hlH, tc);
+          drawClippedText(renderer, FONT_UI, 15, yPos, toggleStr, sw - 30, !tc);
+        } else {
+          drawClippedText(renderer, FONT_UI, 15, yPos, toggleStr, sw - 30, tc);
+        }
       }
-
-      // RSSI on the right
-      char rssiStr[16];
-      snprintf(rssiStr, sizeof(rssiStr), "%ddBm", devices[deviceIndex].rssi);
-      drawRightText(renderer, FONT_SMALL, sw - 10, yPos, rssiStr, tc);
     }
 
     // Page indicator
-    if (deviceCount > maxDevicesToShow) {
+    if (itemCount > maxToShow) {
       char navHint[32];
-      int pageNum = (bluetoothDeviceSelection / maxDevicesToShow) + 1;
-      int totalPages = (deviceCount + maxDevicesToShow - 1) / maxDevicesToShow;
+      int pageNum = (sel / maxToShow) + 1;
+      int totalPages = (itemCount + maxToShow - 1) / maxToShow;
       snprintf(navHint, sizeof(navHint), "Page %d/%d", pageNum, totalPages);
-      int navY = headY + (devicesToShow * rowHeight(renderer, FONT_UI));
+      int navY = headY + (itemsToShow * rowH);
       if (navY < sh - 100)
         drawClippedText(renderer, FONT_SMALL, 15, navY, navHint, 0, tc);
     }
@@ -800,8 +898,17 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   const int bm = 8 + footerLineH * 2 + 8;
   if (sh > bm + 30) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8, "Enter: Connect   D: Forget", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8 + footerLineH, "Left: Disconnect   Esc: Back", 0, tc);
+    if (pairedForgetPending && count > 0) {
+      std::string addr, name; uint8_t addrType;
+      getPairedKeyboard(pairedKeyboardSelection, addr, name, addrType);
+      char prompt[64];
+      snprintf(prompt, sizeof(prompt), "Forget \"%s\"?", name.c_str());
+      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8, prompt, sw - 20, tc, EpdFontFamily::BOLD);
+      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8 + footerLineH, "Enter: Yes   Esc: No", 0, tc);
+    } else {
+      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8, "Up/Down: Move   Enter: Connect", 0, tc);
+      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8 + footerLineH, "Right: Forget   Esc: Back", 0, tc);
+    }
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -919,7 +1026,8 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       if (cursorX + cursorW < sw)
         renderer.fillRect(cursorX, 66, cursorW, cursorH, tc);
 
-      drawClippedText(renderer, FONT_SMALL, 20, 110, "Enter: Connect   Esc: Cancel", 0, tc);
+      drawClippedText(renderer, FONT_SMALL, 20, 104, "Password input uses US QWERTY", sw - 40, tc);
+      drawClippedText(renderer, FONT_SMALL, 20, 122, "Enter: Connect   Esc: Cancel", 0, tc);
       break;
     }
 
@@ -1024,4 +1132,3 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
 }
-

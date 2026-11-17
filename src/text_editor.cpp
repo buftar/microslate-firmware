@@ -7,6 +7,17 @@ static char textBuffer[TEXT_BUFFER_SIZE];
 static size_t textLength = 0;
 static int cursorPosition = 0;
 
+// --- Selection + clipboard ---
+// selectionAnchor < 0 means no selection. When >= 0, the selection is the range
+// between it and cursorPosition (empty if they coincide). The clipboard is a
+// separate buffer that persists across notes (never cleared on load/clear).
+static int selectionAnchor = -1;
+static char clipboard[TEXT_BUFFER_SIZE];
+static size_t clipboardLen = 0;
+
+// Set when a newline is inserted; consumed by the autosave (paragraph-break flush).
+static bool paragraphBreakPending = false;
+
 // --- File metadata ---
 static char currentFile[MAX_FILENAME_LEN] = "";
 static char currentTitle[MAX_TITLE_LEN] = "Untitled";
@@ -14,7 +25,6 @@ static bool unsavedChanges = false;
 
 // --- Line management ---
 static int linePositions[MAX_LINES];  // Index into textBuffer for start of each line
-static int lineScratch[MAX_LINES];    // Scratch copy of the pre-edit line-start suffix, used by the incremental resync below to diff against post-edit offsets.
 static int lineCount = 0;
 static int cursorLine = 0;
 static int cursorCol = 0;
@@ -22,200 +32,132 @@ static int viewportStartLine = 0;
 static int charsPerLine = 40;
 static int storedVisibleLines = 20;  // Updated by renderer each frame
 static bool lineBreaksDirty = true;  // Only recompute line breaks when buffer/charsPerLine changes
-// Line index to resync from after a single-char insert/delete, or -1 to force a full rebuild
-// (whole-buffer load, charsPerLine change). Valid only when lineBreaksDirty is true.
-static int lineBreaksDirtyFrom = -1;
-static int pendingEditDelta = 0;  // +1 insert / -1 delete; valid only when lineBreaksDirtyFrom >= 0
-
-// Word count is maintained incrementally per edit (see applyInsertWordCountDelta /
-// applyDeleteWordCountDelta) instead of rescanning the whole buffer every keystroke.
-static int cachedWordCount = 0;
 
 // Forward declaration
 static void ensureCursorVisible(int visibleLines);
 
-static inline bool isWordBoundaryChar(char c) {
-  return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+static bool isUtf8ContinuationByte(unsigned char c) {
+  return (c & 0xC0) == 0x80;
 }
 
-static void recomputeWordCountFull() {
-  cachedWordCount = 0;
-  bool inWord = false;
-  for (size_t i = 0; i < textLength; i++) {
-    if (isWordBoundaryChar(textBuffer[i])) {
-      inWord = false;
-    } else if (!inWord) {
-      cachedWordCount++;
-      inWord = true;
-    }
+static int utf8CharLenAt(int pos) {
+  if (pos < 0 || pos >= (int)textLength) return 0;
+  unsigned char c = static_cast<unsigned char>(textBuffer[pos]);
+  int len = 1;
+  if (c < 0x80) len = 1;
+  else if ((c >> 5) == 0x6) len = 2;
+  else if ((c >> 4) == 0xE) len = 3;
+  else if ((c >> 3) == 0x1E) len = 4;
+  if (pos + len > (int)textLength) return 1;
+  return len;
+}
+
+static int utf8NextPos(int pos) {
+  if (pos >= (int)textLength) return (int)textLength;
+  int next = pos + utf8CharLenAt(pos);
+  return std::min(next, (int)textLength);
+}
+
+static int utf8PrevPos(int pos) {
+  if (pos <= 0) return 0;
+  pos--;
+  while (pos > 0 && isUtf8ContinuationByte(static_cast<unsigned char>(textBuffer[pos]))) {
+    pos--;
   }
+  return pos;
 }
 
-static inline bool isBoundaryOrMissing(int idx) {
-  if (idx < 0 || idx >= (int)textLength) return true;
-  return isWordBoundaryChar(textBuffer[idx]);
-}
-
-// Call BEFORE inserting: p is the pre-edit position character c will be inserted at.
-static void applyInsertWordCountDelta(int p, char c) {
-  const bool cIsWord = !isWordBoundaryChar(c);
-  const bool lBoundary = isBoundaryOrMissing(p - 1);
-  const bool rBoundary = isBoundaryOrMissing(p);
-  if (cIsWord && lBoundary && rBoundary) {
-    cachedWordCount++;  // new isolated word created between two separators
-  } else if (!cIsWord && !lBoundary && !rBoundary) {
-    cachedWordCount++;  // splits one run into two
+static int utf8CountChars(int start, int end) {
+  start = std::max(0, start);
+  end = std::min(end, (int)textLength);
+  int count = 0;
+  for (int i = start; i < end; i = utf8NextPos(i)) {
+    count++;
   }
+  return count;
 }
 
-// Call BEFORE removing: p is the pre-edit position of the character being deleted.
-static void applyDeleteWordCountDelta(int p) {
-  const bool cIsWord = !isWordBoundaryChar(textBuffer[p]);
-  const bool lBoundary = isBoundaryOrMissing(p - 1);
-  const bool rBoundary = isBoundaryOrMissing(p + 1);
-  if (cIsWord && lBoundary && rBoundary) {
-    cachedWordCount--;  // removed the sole char of an isolated word
-  } else if (!cIsWord && !lBoundary && !rBoundary) {
-    cachedWordCount--;  // merges two runs into one
-  }
+static int lineContentEnd(int lineIndex) {
+  int lineStart = linePositions[lineIndex];
+  int lineEnd = (lineIndex + 1 < lineCount) ? linePositions[lineIndex + 1] : (int)textLength;
+  if (lineEnd > lineStart && textBuffer[lineEnd - 1] == '\n') lineEnd--;
+  return lineEnd;
 }
 
-// Walk back over consecutive soft (non-newline) breaks to find the true safe resync start.
-static int resolveResyncStartLine(int candidateLine) {
-  while (candidateLine > 0 && textBuffer[linePositions[candidateLine] - 1] != '\n') {
-    candidateLine--;
+static int byteOffsetForColumn(int lineStart, int lineEnd, int col) {
+  int pos = lineStart;
+  for (int i = 0; i < col && pos < lineEnd; i++) {
+    pos = utf8NextPos(pos);
   }
-  return candidateLine;
+  return std::min(pos, lineEnd);
+}
+
+static void deleteByteRange(int start, int end) {
+  if (start < 0 || end <= start || start >= (int)textLength) return;
+  end = std::min(end, (int)textLength);
+
+  memmove(textBuffer + start, textBuffer + end, textLength - end);
+  textLength -= (end - start);
+  cursorPosition = start;
+  textBuffer[textLength] = '\0';
+  unsavedChanges = true;
+  lineBreaksDirty = true;
+
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
 }
 
 // Recalculate line breaks (word wrap) and cursor position.
-// The O(textLength) line break loop only runs on a whole-buffer load or charsPerLine change
-// (lineBreaksDirtyFrom == -1); a single-char insert/delete instead resyncs forward from the
-// edited line only, stopping as soon as a post-edit line-start offset lines up with a
-// pre-edit one (everything after that point is guaranteed byte-identical to the old wrap).
+// The O(textLength) line break loop only runs when the buffer or charsPerLine changed.
 // Cursor line/col is always recomputed (cheap O(cursorLine) with early exit).
 void editorRecalculateLines() {
   if (lineBreaksDirty) {
-    if (lineBreaksDirtyFrom < 0) {
-      // Full rebuild (whole-buffer load, charsPerLine change)
-      lineCount = 0;
-      linePositions[0] = 0;
-      lineCount = 1;
+    lineCount = 0;
+    linePositions[0] = 0;
+    lineCount = 1;
 
-      int col = 0;
-      int lastSpace = -1;
+    int col = 0;
+    int lastSpace = -1;
 
-      for (int i = 0; i < (int)textLength && lineCount < MAX_LINES; i++) {
-        if (textBuffer[i] == '\n') {
-          if (lineCount < MAX_LINES) {
-            linePositions[lineCount] = i + 1;
-            lineCount++;
-          }
-          col = 0;
-          lastSpace = -1;
-          continue;
+    for (int i = 0; i < (int)textLength && lineCount < MAX_LINES;) {
+      if (textBuffer[i] == '\n') {
+        // Hard line break
+        if (lineCount < MAX_LINES) {
+          linePositions[lineCount] = i + 1;
+          lineCount++;
         }
-
-        if (textBuffer[i] == ' ') {
-          lastSpace = i;
-        }
-
-        col++;
-        if (col >= charsPerLine) {
-          int breakPos;
-          if (lastSpace > linePositions[lineCount - 1]) {
-            breakPos = lastSpace + 1;
-          } else {
-            breakPos = i + 1;
-          }
-
-          if (lineCount < MAX_LINES) {
-            linePositions[lineCount] = breakPos;
-            lineCount++;
-          }
-          col = i + 1 - breakPos;
-          lastSpace = -1;
-        }
-      }
-      recomputeWordCountFull();
-    } else {
-      // Incremental resync from edited line
-      const int startLine = lineBreaksDirtyFrom;
-
-      // Snapshot the pre-edit suffix before overwriting linePositions[] in place.
-      const int oldSuffixLen = lineCount - startLine;
-      for (int k = 0; k < oldSuffixLen; k++) {
-        lineScratch[k] = linePositions[startLine + k];
+        col = 0;
+        lastSpace = -1;
+        i++;
+        continue;
       }
 
-      lineCount = startLine + 1;  // linePositions[startLine] itself is unaffected by the edit
-      int oldIdx = 1;             // lineScratch[0] == linePositions[startLine], already matched
-
-      int col = 0;
-      int lastSpace = -1;
-
-      for (int i = linePositions[startLine]; i < (int)textLength && lineCount < MAX_LINES; i++) {
-        if (textBuffer[i] == '\n') {
-          if (lineCount < MAX_LINES) {
-            linePositions[lineCount] = i + 1;
-            lineCount++;
-          }
-          col = 0;
-          lastSpace = -1;
-          // Check convergence: if this offset matches the old one, everything after is identical
-          if (oldIdx < oldSuffixLen && linePositions[lineCount - 1] == lineScratch[oldIdx]) {
-            // Copy remaining old offsets — the rest of the wrap is byte-identical
-            for (int r = oldIdx + 1; r < oldSuffixLen; r++) {
-              if (lineCount < MAX_LINES) {
-                linePositions[lineCount] = lineScratch[r];
-                lineCount++;
-              }
-            }
-            goto resync_done;
-          }
-          oldIdx++;
-          continue;
-        }
-
-        if (textBuffer[i] == ' ') {
-          lastSpace = i;
-        }
-
-        col++;
-        if (col >= charsPerLine) {
-          int breakPos;
-          if (lastSpace > linePositions[lineCount - 1]) {
-            breakPos = lastSpace + 1;
-          } else {
-            breakPos = i + 1;
-          }
-
-          if (lineCount < MAX_LINES) {
-            linePositions[lineCount] = breakPos;
-            lineCount++;
-          }
-          col = i + 1 - breakPos;
-          lastSpace = -1;
-
-          if (oldIdx < oldSuffixLen && linePositions[lineCount - 1] == lineScratch[oldIdx]) {
-            for (int r = oldIdx + 1; r < oldSuffixLen; r++) {
-              if (lineCount < MAX_LINES) {
-                linePositions[lineCount] = lineScratch[r];
-                lineCount++;
-              }
-            }
-            goto resync_done;
-          }
-          oldIdx++;
-        }
+      int charEnd = utf8NextPos(i);
+      if (textBuffer[i] == ' ') {
+        lastSpace = i;
       }
 
-    resync_done:
-      ;
+      col++;
+      if (col >= charsPerLine) {
+        // Word wrap
+        int breakPos;
+        if (lastSpace > linePositions[lineCount - 1]) {
+          breakPos = lastSpace + 1; // Break after space
+        } else {
+          breakPos = charEnd;  // Hard break mid-word, but never inside UTF-8
+        }
+
+        if (lineCount < MAX_LINES) {
+          linePositions[lineCount] = breakPos;
+          lineCount++;
+        }
+        col = utf8CountChars(breakPos, charEnd);
+        lastSpace = -1;
+      }
+
+      i = charEnd;
     }
     lineBreaksDirty = false;
-    lineBreaksDirtyFrom = -1;
-    pendingEditDelta = 0;
   }
 
   // Compute cursor line and column (always — cheap O(cursorLine) with early exit)
@@ -227,7 +169,7 @@ void editorRecalculateLines() {
       break;
     }
   }
-  cursorCol = cursorPosition - linePositions[cursorLine];
+  cursorCol = utf8CountChars(linePositions[cursorLine], cursorPosition);
 }
 
 // Ensure cursor is visible by adjusting viewport
@@ -248,13 +190,12 @@ void editorInit() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = -1;
   currentFile[0] = '\0';
   strncpy(currentTitle, "Untitled", MAX_TITLE_LEN - 1);
   unsavedChanges = false;
   viewportStartLine = 0;
-  cachedWordCount = 0;
   lineBreaksDirty = true;
-  lineBreaksDirtyFrom = -1;
   editorRecalculateLines();
 }
 
@@ -262,11 +203,10 @@ void editorClear() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = -1;
   unsavedChanges = false;
   viewportStartLine = 0;
-  cachedWordCount = 0;
   lineBreaksDirty = true;
-  lineBreaksDirtyFrom = -1;
   editorRecalculateLines();
 }
 
@@ -274,9 +214,9 @@ void editorLoadBuffer(size_t length) {
   textLength = length;
   textBuffer[textLength] = '\0';
   cursorPosition = (int)textLength;  // Start at end
+  selectionAnchor = -1;
   viewportStartLine = 0;
   lineBreaksDirty = true;
-  lineBreaksDirtyFrom = -1;  // Full rebuild
   editorRecalculateLines();
   // Scroll to show cursor
   ensureCursorVisible(storedVisibleLines);
@@ -287,136 +227,163 @@ size_t editorGetLength() { return textLength; }
 int editorGetCursorPosition() { return cursorPosition; }
 
 int editorGetWordCount() {
-  // Incremental word count — maintained per edit, not rescanned every call.
-  return cachedWordCount;
+  int count = 0;
+  bool inWord = false;
+  for (size_t i = 0; i < textLength; i++) {
+    char c = textBuffer[i];
+    if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+      inWord = false;
+    } else {
+      if (!inWord) { count++; inWord = true; }
+    }
+  }
+  return count;
 }
 
 void editorInsertChar(char c) {
-  if (textLength >= TEXT_BUFFER_SIZE - 1) return;
+  char text[2] = {c, '\0'};
+  editorInsertText(text);
+}
 
-  // Incremental word count delta (before the insert changes the buffer)
-  applyInsertWordCountDelta(cursorPosition, c);
+void editorInsertText(const char* text) {
+  if (!text || text[0] == '\0') return;
+  if (strchr(text, '\n')) paragraphBreakPending = true;  // flag paragraph breaks for autosave
+  // Typing over a selection replaces it.
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);  // cursor now at lo
+  }
+  size_t insertLen = strlen(text);
+  if (textLength + insertLen >= TEXT_BUFFER_SIZE) return;
 
   // Shift text right
-  for (int i = (int)textLength; i > cursorPosition; i--) {
-    textBuffer[i] = textBuffer[i - 1];
-  }
-  textBuffer[cursorPosition] = c;
-  cursorPosition++;
-  textLength++;
+  memmove(textBuffer + cursorPosition + insertLen,
+          textBuffer + cursorPosition,
+          textLength - cursorPosition);
+  memcpy(textBuffer + cursorPosition, text, insertLen);
+  cursorPosition += insertLen;
+  textLength += insertLen;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
-
-  // Incremental line resync from the edited line
   lineBreaksDirty = true;
-  lineBreaksDirtyFrom = cursorLine;  // resync from current line
-  lineBreaksDirtyFrom = resolveResyncStartLine(lineBreaksDirtyFrom);
-  pendingEditDelta = 1;
 
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
 void editorDeleteChar() {
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+    return;
+  }
   if (cursorPosition <= 0 || textLength == 0) return;
 
-  // Incremental word count delta (before the delete changes the buffer)
-  applyDeleteWordCountDelta(cursorPosition - 1);
-
-  for (int i = cursorPosition - 1; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  cursorPosition--;
-  textLength--;
-  textBuffer[textLength] = '\0';
-  unsavedChanges = true;
-
-  // Incremental line resync from the edited line
-  lineBreaksDirty = true;
-  lineBreaksDirtyFrom = cursorLine;
-  lineBreaksDirtyFrom = resolveResyncStartLine(lineBreaksDirtyFrom);
-  pendingEditDelta = -1;
-
-  editorRecalculateLines();
-  ensureCursorVisible(storedVisibleLines);
+  int start = utf8PrevPos(cursorPosition);
+  deleteByteRange(start, cursorPosition);
 }
 
 void editorDeleteForward() {
+  if (editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+    return;
+  }
   if (cursorPosition >= (int)textLength) return;
 
-  // Incremental word count delta
-  applyDeleteWordCountDelta(cursorPosition);
-
-  for (int i = cursorPosition; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  textLength--;
-  textBuffer[textLength] = '\0';
-  unsavedChanges = true;
-
-  // Incremental line resync
-  lineBreaksDirty = true;
-  lineBreaksDirtyFrom = cursorLine;
-  lineBreaksDirtyFrom = resolveResyncStartLine(lineBreaksDirtyFrom);
-  pendingEditDelta = -1;
-
-  editorRecalculateLines();
-  ensureCursorVisible(storedVisibleLines);
+  int end = utf8NextPos(cursorPosition);
+  deleteByteRange(cursorPosition, end);
 }
 
-void editorMoveCursorLeft() {
+// Called at the start of a cursor move: extend=true arms/keeps the selection
+// anchor; extend=false drops any selection.
+static void updateSelectionAnchor(bool extend) {
+  if (extend) {
+    if (selectionAnchor < 0) selectionAnchor = cursorPosition;
+  } else {
+    selectionAnchor = -1;
+  }
+}
+
+void editorMoveCursorLeft(bool extend) {
+  // Plain Left with a selection collapses to its left edge, without moving further.
+  if (!extend && editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    cursorPosition = lo;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
+  updateSelectionAnchor(extend);
   if (cursorPosition > 0) {
-    cursorPosition--;
+    cursorPosition = utf8PrevPos(cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorRight() {
+void editorMoveCursorRight(bool extend) {
+  if (!extend && editorHasSelection()) {
+    int lo, hi;
+    editorGetSelectionRange(&lo, &hi);
+    selectionAnchor = -1;
+    cursorPosition = hi;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
+  updateSelectionAnchor(extend);
   if (cursorPosition < (int)textLength) {
-    cursorPosition++;
+    cursorPosition = utf8NextPos(cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorUp() {
+void editorMoveCursorUp(bool extend) {
+  updateSelectionAnchor(extend);
   // cursorLine/cursorCol are already valid from the previous operation
   if (cursorLine <= 0) return;
 
   int targetLine = cursorLine - 1;
   int lineStart = linePositions[targetLine];
-  int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  // Don't count trailing newline
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  int lineEnd = lineContentEnd(targetLine);
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = byteOffsetForColumn(lineStart, lineEnd, cursorCol);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorDown() {
+void editorMoveCursorDown(bool extend) {
+  updateSelectionAnchor(extend);
   if (cursorLine >= lineCount - 1) return;
 
   int targetLine = cursorLine + 1;
   int lineStart = linePositions[targetLine];
-  int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  int lineEnd = lineContentEnd(targetLine);
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = byteOffsetForColumn(lineStart, lineEnd, cursorCol);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorHome() {
+void editorMoveCursorHome(bool extend) {
+  updateSelectionAnchor(extend);
   cursorPosition = linePositions[cursorLine];
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorEnd() {
+void editorMoveCursorEnd(bool extend) {
+  updateSelectionAnchor(extend);
   int lineEnd;
   if (cursorLine + 1 < lineCount) {
     lineEnd = linePositions[cursorLine + 1];
@@ -429,6 +396,88 @@ void editorMoveCursorEnd() {
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
+
+// --- Selection + clipboard ---
+
+bool editorHasSelection() {
+  return selectionAnchor >= 0 && selectionAnchor != cursorPosition;
+}
+
+bool editorGetSelectionRange(int* lo, int* hi) {
+  if (!editorHasSelection()) return false;
+  int a = selectionAnchor;
+  int b = cursorPosition;
+  if (a > b) { int t = a; a = b; b = t; }
+  if (lo) *lo = a;
+  if (hi) *hi = b;
+  return true;
+}
+
+void editorSelectAll() {
+  if (textLength == 0) return;
+  selectionAnchor = 0;
+  cursorPosition = (int)textLength;
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
+void editorCopy() {
+  int lo, hi;
+  if (!editorGetSelectionRange(&lo, &hi)) return;
+  size_t n = (size_t)(hi - lo);
+  if (n >= TEXT_BUFFER_SIZE) n = TEXT_BUFFER_SIZE - 1;
+  memcpy(clipboard, textBuffer + lo, n);
+  clipboard[n] = '\0';
+  clipboardLen = n;
+}
+
+void editorCut() {
+  int lo, hi;
+  if (!editorGetSelectionRange(&lo, &hi)) return;
+  editorCopy();
+  selectionAnchor = -1;
+  deleteByteRange(lo, hi);  // sets cursor = lo, recalculates
+}
+
+void editorPaste() {
+  if (clipboardLen == 0) return;
+  // Replace an active selection, then insert the clipboard at the caret.
+  int lo, hi;
+  if (editorGetSelectionRange(&lo, &hi)) {
+    selectionAnchor = -1;
+    deleteByteRange(lo, hi);
+  }
+  editorInsertText(clipboard);  // bounds-checked; no-op if it would overflow
+}
+
+bool editorFindNext(const char* query) {
+  if (!query || query[0] == '\0' || textLength == 0) return false;
+  int qlen = (int)strlen(query);
+  if (qlen > (int)textLength) return false;
+
+  // Search forward from the caret, then wrap to the start. Plain byte compare is
+  // UTF-8 safe: the query's bytes only match a whole character's bytes in the buffer.
+  int from = cursorPosition;
+  int match = -1;
+  for (int i = from; i + qlen <= (int)textLength; i++) {
+    if (memcmp(textBuffer + i, query, qlen) == 0) { match = i; break; }
+  }
+  if (match < 0) {
+    for (int i = 0; i + qlen <= from && i + qlen <= (int)textLength; i++) {
+      if (memcmp(textBuffer + i, query, qlen) == 0) { match = i; break; }
+    }
+  }
+  if (match < 0) return false;
+
+  selectionAnchor = match;             // highlight the hit via the selection renderer
+  cursorPosition = match + qlen;       // caret past the match so Enter finds the next
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+  return true;
+}
+
+bool editorHasParagraphBreakPending() { return paragraphBreakPending; }
+void editorClearParagraphBreak() { paragraphBreakPending = false; }
 
 void editorSetCharsPerLine(int cpl) {
   if (cpl != charsPerLine) {
