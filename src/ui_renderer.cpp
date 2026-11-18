@@ -15,6 +15,7 @@
 #include "sleep/sleep_screen.h"
 #include "input_handler.h"   // the editor menu and SD warning state
 #include "settings_menu.h"
+#include "dual_boot.h"
 #include "spell/spell_dict.h"
 #include "spell/spell_service.h"
 
@@ -563,7 +564,7 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   static const char* menuItems[] = {"Notes", "Settings", "Transfer", "Sync"};
-  const int menuCount = 4;
+  const int menuCount = dualboot::otherName() ? 5 : 4;
 
   // The keyboard status line lives under the cards; the cards scroll if they don't fit.
   const int statusH = 34;
@@ -581,7 +582,7 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
     const int y = g.top + i * MENU_ROW_PITCH;
     addCardRow(pos, y, sw, MENU_ROW_PITCH, g.inset);
     const bool ink = drawCard(renderer, tc, y, MENU_ROW_H, pos == mainMenuSelection, false, g.inset);
-    const char* label = menuItems[pos];
+    const char* label = pos < 4 ? menuItems[pos] : dualboot::otherName();
     drawClippedText(renderer, LIST_FONT_L, 22, y + (MENU_ROW_H - lhL) / 2, label, cw - 50, ink);
   }
   drawScrollbar(renderer, tc, g, MENU_ROW_PITCH, start, menuCount);

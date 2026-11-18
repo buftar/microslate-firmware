@@ -21,6 +21,7 @@
 #include "sd_backup.h"
 
 #include "config.h"
+#include "dual_boot.h"
 #include "ble_keyboard.h"
 #include "input_handler.h"
 #include "text_editor.h"
@@ -256,6 +257,7 @@ void setup() {
 
   // Load the UI settings early so the startup screen uses the saved orientation
   uiprefs::load();
+  dualboot::begin();
   applyOrientation();
 
   editorInit();
@@ -488,6 +490,11 @@ static void processPhysicalButtons() {
     backHeld = false;
   }
 
+  // X3: the front Left/Right sit the other way round from the X4, so their scroll direction flips (literal
+  // Left/Right, as in the editor and the bottom bar, stays).
+  const uint8_t kScrollRight = gpio.deviceIsX3() ? HID_KEY_DOWN : HID_KEY_UP;
+  const uint8_t kScrollLeft = gpio.deviceIsX3() ? HID_KEY_UP : HID_KEY_DOWN;
+
   // Map physical buttons to HID key codes based on current UI state
   switch (currentState) {
     // List screens (all with the shared bottom bar): Up/Down scroll; the front Left/Right
@@ -503,8 +510,8 @@ static void processPhysicalButtons() {
     case UIState::LAYOUT_EDITOR: {
       if (btnUp && !btnUpLast) tapKey(HID_KEY_UP);
       if (btnDown && !btnDownLast) tapKey(HID_KEY_DOWN);
-      if (btnRight && !btnRightLast) tapKey(uiBarFocus >= 0 ? HID_KEY_RIGHT : HID_KEY_UP);
-      if (btnLeft && !btnLeftLast) tapKey(uiBarFocus >= 0 ? HID_KEY_LEFT : HID_KEY_DOWN);
+      if (btnRight && !btnRightLast) tapKey(uiBarFocus >= 0 ? HID_KEY_RIGHT : kScrollRight);
+      if (btnLeft && !btnLeftLast) tapKey(uiBarFocus >= 0 ? HID_KEY_LEFT : kScrollLeft);
       if (btnConfirm && !btnConfirmLast) tapKey(HID_KEY_ENTER);
       if (btnBack && !btnBackLast) tapKey(HID_KEY_ESCAPE);
       break;
@@ -553,8 +560,10 @@ static void processPhysicalButtons() {
     case UIState::WIFI_SYNC:
     case UIState::TRANSFER:
     case UIState::FW_UPDATE:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) tapKey(HID_KEY_UP);
-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) tapKey(HID_KEY_DOWN);
+      if (btnUp && !btnUpLast) tapKey(HID_KEY_UP);
+      if (btnDown && !btnDownLast) tapKey(HID_KEY_DOWN);
+      if (btnRight && !btnRightLast) tapKey(kScrollRight);
+      if (btnLeft && !btnLeftLast) tapKey(kScrollLeft);
       if (btnConfirm && !btnConfirmLast) tapKey(HID_KEY_ENTER);
       if (btnBack && !btnBackLast) tapKey(HID_KEY_ESCAPE);
       break;

@@ -11,6 +11,7 @@
 #include "spell/spell_service.h"
 #include "frontlight.h"
 #include "settings_menu.h"
+#include "dual_boot.h"
 
 #include <HidCore.h>
 #include <Keymap.h>
@@ -753,7 +754,7 @@ static void dispatchEvent(const KeyEvent& event) {
 
   switch (currentState) {
     case UIState::MAIN_MENU: {
-      const int menuCount = 4;   // Notes, Settings, Transfer, Sync
+      const int menuCount = dualboot::otherName() ? 5 : 4;   // Notes, Settings, Transfer, Sync[, other app]
       int act = -1;
       if (barNav(event, mainMenuSelection, menuCount, act)) break;
       if (event.keyCode == HID_KEY_ENTER) {
@@ -775,6 +776,8 @@ static void dispatchEvent(const KeyEvent& event) {
           wifiSyncStart();
           currentState = UIState::WIFI_SYNC;
           screenDirty = true;
+        } else if (mainMenuSelection == 4) {
+          dualboot::switchToOther();
         }
       }
       break;

@@ -102,7 +102,7 @@ static constexpr int MAX_LINES = (int)TEXT_BUFFER_SIZE + 1;
 static constexpr size_t UNDO_HISTORY_SIZE = 1048576;
 #else
 static constexpr size_t TEXT_BUFFER_SIZE = 16384;
-static constexpr int MAX_LINES = 1024;
+static constexpr int MAX_LINES = 4096;  // 1024 capped a 16 KB note at ~16 chars/line; the table grows on demand
 // The X4 has no PSRAM: a small history (about a hundred typed words), to be checked against its free heap.
 static constexpr size_t UNDO_HISTORY_SIZE = 4096;
 #endif
